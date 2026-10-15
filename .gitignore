@@ -1,0 +1,20 @@
+.env
+.env.*
+!.env.example
+cabinets.json
+token.json
+client_secret.json
+data/
+__pycache__/
+secrets/
+*.key
+*.pem
+# journaux (noms de clients, SIREN), archives, profils Chrome, environnement Python, fichiers locaux
+*.log
+*.zip
+*.sqlite
+*.db
+chrome-profile*/
+.venv/
+.DS_Store
+.claude/

@@ -1,0 +1,17 @@
+{
+  "Keobiz": {
+    "libelle": "Keobiz",
+    "portal_login_env": "PORTAIL_KEOBIZ_LOGIN",
+    "portal_password_env": "PORTAIL_KEOBIZ_PASSWORD",
+    "sender_address": "contact@exemple.fr",
+    "reply_to": "contact@exemple.fr",
+    "telephone": "01.23.45.67.89",
+    "adresse": "1 rue de l'Exemple 75000 Paris",
+    "site_web": "www.keobiz.fr",
+    "logo": "templates/logo.png",
+    "logo_url": "https://www.keobiz.fr/wp-content/uploads/2025/02/keobiz-logo-kerogo@3x.png",
+    "template": "templates/email_keobiz.html",
+    "signature_html": "<table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\" style=\"font-family:Arial,Helvetica,sans-serif;\"><tr><td style=\"padding:8px 28px 8px 0;vertical-align:middle;\">{logo}</td><td style=\"border-left:4px solid #3a9a6e;padding:6px 0 6px 22px;vertical-align:middle;font-size:15px;line-height:1.9;color:#1f3a68;\"><div style=\"font-size:17px;font-weight:bold;margin-bottom:6px;\">{cdm_nom}</div><div>&#128241;&nbsp; {telephone}</div><div>&#9993;&#65039;&nbsp; <a href=\"mailto:{reply_to}\" style=\"color:#1f3a68;text-decoration:none;\">{reply_to}</a></div><div>&#128205;&nbsp; {adresse}</div><div>&#127760;&nbsp; <a href=\"https://{site_web}\" style=\"color:#1f3a68;text-decoration:none;\">{site_web}</a></div></td></tr></table>",
+    "active": true
+  }
+}
