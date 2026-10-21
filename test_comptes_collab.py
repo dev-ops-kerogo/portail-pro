@@ -29,6 +29,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import config
+import portailpro
 from portailpro import API_BASE, LIST_PATH, DOC_PATH, START_URL, PortailPro, PortailProError
 from salesforce_client import ACCOUNT_FIELDS, SalesforceClient, _normalize
 
@@ -141,6 +142,8 @@ def single_attempt_login(p: PortailPro) -> str:
     """UNE seule soumission du formulaire (pas de nouvel essai) : plusieurs mots de passe erronés
     peuvent bloquer un compte. S'arrête net si le portail répond « mot de passe incorrect »."""
     page = p.page
+    if portailpro.is_refused(p.login_id, p.password) or portailpro.login_blocked_until(p.login_id, p.password):
+        raise PortailProError("Identifiants déjà refusés (ou connexion suspendue) par le service — aucune tentative envoyée")
     p._dismiss_cookie_banner()
     p._wait_form_ready()
     ident, pwd = p._find_ident(), page.locator("input[type='password']").first
@@ -168,6 +171,7 @@ def single_attempt_login(p: PortailPro) -> str:
         except Exception:
             body = ""
         if LOGIN_REFUSED.search(body):
+            portailpro.mark_refused(p.login_id, p.password)   # partagé avec le service : jamais resoumis
             raise PortailProError("Identifiant ou mot de passe REFUSÉ par le portail "
                                   "(1 seule tentative envoyée, aucun nouvel essai)")
         if not p._login_form_visible(timeout_ms=1000) and not re.search(r"/ms/login", page.url):
@@ -180,6 +184,8 @@ def connect(p: PortailPro, label: str, interactive: bool) -> str:
     p.page.goto(START_URL, wait_until="domcontentloaded")
     if p._login_form_visible(timeout_ms=15000):
         # Collaborateurs : une seule tentative ; Keobiz : connexion habituelle du service.
+        if not interactive and portailpro.is_refused(p.login_id, p.password):
+            raise PortailProError("Identifiants déjà refusés par le service — aucune tentative envoyée")
         how = single_attempt_login(p) if interactive else (p._fill_login_form() or "connexion par identifiants")
     else:
         how = "session déjà ouverte (profil Chrome mémorisé)"

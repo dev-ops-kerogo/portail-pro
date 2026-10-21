@@ -18,3 +18,11 @@ chrome-profile*/
 .venv/
 .DS_Store
 .claude/
+# clés de comptes techniques Google (jamais dans le dépôt)
+credentials*.json
+*service*account*.json
+*-sa.json
+# tout JSON à la racine (clés téléchargées : <projet>-<id>.json…), sauf les modèles suivis
+/*.json
+!/cabinets.example.json
+!/slack_manifest.json

@@ -2,8 +2,8 @@
 
 Pour chaque demande : session portailpro → PDF → email Gmail → archivage Salesforce → notification Slack.
 Comptes portail essayés dans l'ordre : celui du cabinet, puis le compte personnel du chargé de mission du client
-s'il est déclaré dans .env (PORTAIL_COLLAB<n>_*). Un compte « non habilité » pour le client passe la main au suivant ;
-si aucun n'est habilité, la demande passe en NOT_HABILITE (ce n'est pas « aucun document »).
+s'il est déclaré (Google Sheet des accès ou .env — voir accounts.py). Un compte « non habilité » pour le client passe la
+main au suivant ; si aucun n'est habilité, la demande passe en NOT_HABILITE (ce n'est pas « aucun document »).
 """
 from __future__ import annotations
 
@@ -14,12 +14,14 @@ import threading
 import time
 from pathlib import Path
 
+import accounts
 import config
 import db
 import documents
 from config import Cabinet, PortalAccount
 from mailer import Mailer
-from portailpro import NonHabiliteError, PortailLoginAbandoned, PortailLoginRefused, PortailPro, PortailProError
+from portailpro import (NonHabiliteError, PortailLoginAbandoned, PortailLoginRefused, PortailPro, PortailProError,
+                        _credentials_key)
 from salesforce_client import SalesforceClient
 
 log = logging.getLogger("worker")
@@ -27,18 +29,24 @@ log = logging.getLogger("worker")
 
 class Worker(threading.Thread):
     def __init__(self, work_queue: queue.Queue, slack_client, cabinets: dict[str, Cabinet],
-                 sf: SalesforceClient, mailer: Mailer, collabs: dict[str, PortalAccount] | None = None):
+                 sf: SalesforceClient, mailer: Mailer, collabs: dict[str, PortalAccount] | None = None,
+                 registry: accounts.AccountRegistry | None = None):
         super().__init__(name="worker", daemon=True)
         self.queue, self.slack, self.cabinets, self.sf, self.mailer = work_queue, slack_client, cabinets, sf, mailer
-        self.collabs = config.load_collab_accounts() if collabs is None else collabs
-        self.portails: dict[str, PortailPro] = {}
-        self.unusable: dict[str, tuple[str, float]] = {}   # compte écarté → (raison, jusqu'à quand)
+        self._static_collabs = collabs   # comptes fixes (tests) ; sinon registre relu régulièrement
+        self.registry = registry if (registry is not None or collabs is not None) else accounts.get_registry(self._alert)
+        self.portails: dict[str, PortailPro] = {}           # sessions ouvertes, de la moins à la plus récemment utilisée
+        self.unusable: dict[str, tuple[str, float, tuple]] = {}   # compte écarté → (raison, jusqu'à quand, identifiants)
         self._last_housekeeping = 0.0
+
+    @property
+    def collabs(self) -> dict[str, PortalAccount]:
+        """Comptes des chargés de mission à jour (Google Sheet relu au plus toutes les CREDENTIALS_REFRESH_S)."""
+        return self._static_collabs if self._static_collabs is not None else self.registry.current()
 
     # ------------------------------------------------------------ boucle
     def run(self) -> None:
-        log.info("Worker démarré — comptes portail des chargés de mission : %s",
-                 ", ".join(a.nom or a.email for a in self.collabs.values()) or "aucun")
+        log.info("Worker démarré — %s", self.registry.summary() if self.registry else f"{len(self.collabs)} compte(s)")
         while True:
             try:
                 request_id = self.queue.get(timeout=30)
@@ -53,22 +61,33 @@ class Worker(threading.Thread):
                 self.queue.task_done()
 
     # ------------------------------------------------------------ portail
+    @staticmethod
+    def _close(p) -> None:
+        try:
+            p.close()
+        except Exception:
+            pass
+
     def _session(self, code: str, login: str | None, password: str | None) -> PortailPro:
-        """Session portail d'un compte (profil Chrome = code), créée au premier besoin puis réutilisée."""
-        p = self.portails.get(code)
+        """Session portail d'un compte (profil Chrome = code), créée au premier besoin puis réutilisée. Au plus
+        PORTAIL_MAX_SESSIONS navigateurs ouverts : la session la moins récemment utilisée est refermée (son profil garde
+        la connexion). Identifiants changés (Google Sheet) → session neuve avec les nouveaux."""
+        p = self.portails.pop(code, None)   # réinsérée en fin : ordre = du moins au plus récemment utilisé
+        if p is not None and (getattr(p, "login_id", login), getattr(p, "password", password)) != (login, password):
+            self._close(p)
+            p = None
         if p is None:
+            while len(self.portails) >= max(1, config.PORTAIL_MAX_SESSIONS):
+                self._close(self.portails.pop(next(iter(self.portails))))
             p = PortailPro(config.PROFILES_DIR / code, headless=config.PORTAIL_HEADLESS,
                            channel=config.BROWSER_CHANNEL, login=login, password=password)
-            self.portails[code] = p
+        self.portails[code] = p
         try:
             p.ensure_session()
         except Exception:
             # Session en échec (page morte, délai dépassé, identifiants…) : jetée, recréée proprement au prochain essai.
             self.portails.pop(code, None)
-            try:
-                p.close()
-            except Exception:
-                pass
+            self._close(p)
             raise
         return p
 
@@ -78,49 +97,56 @@ class Worker(threading.Thread):
     def portail_for_collab(self, acc: PortalAccount) -> PortailPro:
         return self._session(acc.code, acc.login, acc.password)
 
-    def _accounts_for(self, req: dict, cabinet: Cabinet) -> list[tuple]:
-        """Comptes à essayer, dans l'ordre : (genre, libellé, code, ouverture de session).
-        Cabinet puis chargé de mission ; pour une demande de campagne, le compte sur lequel l'inventaire a trouvé l'avis
-        (colonne portail_compte, éventuellement celui d'un autre collaborateur) est essayé en premier."""
-        acc = self.collabs.get((req.get("cdm_email") or "").strip().lower())
-        accounts = [("cabinet", cabinet.libelle, cabinet.code, lambda: self.portail_for(cabinet))]
+    def _accounts_for(self, req: dict, cabinet: Cabinet, collabs: dict[str, PortalAccount] | None = None) -> list[tuple]:
+        """Comptes à essayer, dans l'ordre : (genre, libellé, code, ouverture de session, identifiants, source).
+        Cabinet puis chargé de mission (rattaché par son email Salesforce, sinon par son nom) ; pour une demande de
+        campagne, le compte sur lequel l'inventaire a trouvé l'avis (colonne portail_compte, éventuellement celui d'un
+        autre collaborateur) est essayé en premier."""
+        collabs = self.collabs if collabs is None else collabs
+        acc = accounts.find_account(collabs, req.get("cdm_email"), req.get("cdm_nom"))
+        out = [("cabinet", cabinet.libelle, cabinet.code, lambda: self.portail_for(cabinet),
+                _credentials_key(cabinet.portal_login, cabinet.portal_password), ".env")]
+
+        def entry(a: PortalAccount, label: str) -> tuple:
+            return ("collab", label, a.code, lambda: self.portail_for_collab(a), _credentials_key(a.login, a.password), a.source)
         if acc:
-            accounts.append(("collab", acc.nom or req.get("cdm_nom") or acc.email, acc.code,
-                             lambda: self.portail_for_collab(acc)))
-        hinted = next((a for a in self.collabs.values() if a.code == req.get("portail_compte")), None)
+            out.append(entry(acc, acc.nom or req.get("cdm_nom") or acc.email))
+        hinted = next((a for a in collabs.values() if a.code == req.get("portail_compte")), None)
         if hinted:
             label = (acc.nom or req.get("cdm_nom") or acc.email) if hinted is acc else (hinted.nom or hinted.email)
-            accounts = [("collab", label, hinted.code, lambda: self.portail_for_collab(hinted))] + \
-                       [a for a in accounts if a[2] != hinted.code]
-        return accounts
+            out = [entry(hinted, label)] + [a for a in out if a[2] != hinted.code]
+        return out
 
-    def _unusable(self, code: str) -> str | None:
+    def _unusable(self, code: str, key: tuple | None = None) -> str | None:
+        """Raison de l'écartement en cours, ou None. Identifiants changés depuis (Google Sheet) → compte réessayé."""
         entry = self.unusable.get(code)
-        if entry and entry[1] > time.time():
+        if entry and entry[1] > time.time() and (key is None or entry[2] is None or entry[2] == key):
             return entry[0]
         self.unusable.pop(code, None)
         return None
 
-    def _disable(self, code: str, label: str, e: Exception) -> str:
-        """Écarte un compte dont la CONNEXION échoue (jamais pour une erreur de récupération) : jusqu'au redémarrage si le
-        mot de passe est refusé (ne jamais risquer de bloquer le compte), sinon jusqu'à la fin de la suspension des
+    def _disable(self, code: str, label: str, e: Exception, key: tuple | None = None, source: str = ".env") -> str:
+        """Écarte un compte dont la CONNEXION échoue (jamais pour une erreur de récupération) : tant que le mot de passe
+        refusé n'est pas corrigé (ne jamais risquer de bloquer le compte), sinon jusqu'à la fin de la suspension des
         connexions (PortailLoginAbandoned) ou 1 h (code de vérification demandé, portail indisponible…). Alerte une fois."""
         refused = isinstance(e, PortailLoginRefused)
         reason = "identifiants refusés" if refused else f"connexion impossible ({e})"[:200]
         first = code not in self.unusable
-        self.unusable[code] = (reason, float("inf") if refused else (getattr(e, "until", None) or time.time() + 3600))
+        self.unusable[code] = (reason, float("inf") if refused else (getattr(e, "until", None) or time.time() + 3600), key)
         stale = self.portails.pop(code, None)   # session recréée proprement au prochain essai
         if stale is not None:
-            try:
-                stale.close()
-            except Exception:
-                pass
+            self._close(stale)
         if first:
+            sheet = source == accounts.SOURCE_SHEET
             self._alert(f":rotating_light: Compte portail de *{label}* écarté "
-                        + ("jusqu'au prochain redémarrage du service" if refused
+                        + ("jusqu'à la correction de son mot de passe" if refused
                            else f"jusqu'à {time.strftime('%H:%M', time.localtime(self.unusable[code][1]))}")
                         + f" : {reason}. "
-                        + ("Corriger ses identifiants dans .env." if refused
+                        + (("Corriger son mot de passe dans le Google Sheet des accès : il sera réessayé automatiquement "
+                            f"(sous {max(1, config.CREDENTIALS_REFRESH_S // 60)} min)." if sheet
+                            else "Corriger son mot de passe dans .env (ou cabinets.json), puis redémarrer le service.")
+                           + " Le même mot de passe ne sera plus jamais soumis (pour le réessayer tel quel : supprimer "
+                             "data/portail-identifiants-refuses.json)." if refused
                            else "Vérifier s'il faut se connecter une fois à la main (code de vérification)."))
         return reason
 
@@ -139,10 +165,11 @@ class Worker(threading.Thread):
         req_dir.mkdir(parents=True, exist_ok=True)
         results, used, not_habilite, unavailable = None, None, [], []
         current = cabinet.libelle
+        collabs = self.collabs   # une seule lecture par demande
         try:
-            for kind, label, code, open_session in self._accounts_for(req, cabinet):
+            for kind, label, code, open_session, key, source in self._accounts_for(req, cabinet, collabs):
                 current = label
-                reason = self._unusable(code)
+                reason = self._unusable(code, key)
                 if reason:
                     unavailable.append(f"{label} ({reason})")
                     continue
@@ -152,7 +179,7 @@ class Worker(threading.Thread):
                 except Exception as e:   # erreur portail OU du navigateur (délai dépassé, page fermée, profil verrouillé…)
                     if kind == "cabinet" and not isinstance(e, (PortailLoginRefused, PortailLoginAbandoned)):
                         raise                           # comportement historique : alerte + échec, nouvel essai plus tard
-                    unavailable.append(f"{label} ({self._disable(code, label, e)})")
+                    unavailable.append(f"{label} ({self._disable(code, label, e, key, source)})")
                     continue
                 # 2. Récupération : une erreur ponctuelle (maintenance, PDF illisible…) fait échouer CETTE demande
                 #    sans écarter le compte ; seule une reconnexion refusée ou abandonnée l'écarte.
@@ -162,7 +189,7 @@ class Worker(threading.Thread):
                     not_habilite.append(label)          # ce compte n'a pas accès au client → compte suivant
                     continue
                 except (PortailLoginRefused, PortailLoginAbandoned) as e:
-                    unavailable.append(f"{label} ({self._disable(code, label, e)})")
+                    unavailable.append(f"{label} ({self._disable(code, label, e, key, source)})")
                     continue
                 used = (kind, label)
                 break
@@ -183,7 +210,11 @@ class Worker(threading.Thread):
             if unavailable:
                 return self._fail(req, "Vérification impossible, compte(s) portail indisponible(s) : " + ", ".join(unavailable)
                                   + (f" — non habilité(s) : {', '.join(not_habilite)}" if not_habilite else ""))
-            return self._not_habilite(req, not_habilite)
+            if self.registry is not None and self.registry.unknown:   # Sheet jamais lu : comptes inconnus ≠ aucun compte
+                return self._fail(req, "Vérification impossible : Google Sheet des accès illisible, comptes portail des "
+                                       "chargés de mission inconnus" + (f" — non habilité(s) : {', '.join(not_habilite)}"
+                                                                        if not_habilite else ""))
+            return self._not_habilite(req, not_habilite, collabs)
         db.add_event(request_id, "COMPTE_PORTAIL", f"{used[0]} : {used[1]}")
         via = used[1] if used[0] == "collab" else None
 
@@ -273,14 +304,15 @@ class Worker(threading.Thread):
             return False
 
     # ------------------------------------------------------------ issues
-    def _not_habilite(self, req: dict, accounts: list[str]) -> None:
+    def _not_habilite(self, req: dict, labels: list[str], collabs: dict[str, PortalAccount] | None = None) -> None:
         """Aucun des comptes essayés n'a accès au client : ce n'est pas « aucun document »."""
-        names = ", ".join(accounts)
+        names = ", ".join(labels)
         message = f"Compte(s) portail non habilité(s) pour ce client : {names}"
         db.update_request(req["request_id"], status="NOT_HABILITE", error_message=message)
         db.add_event(req["request_id"], "NOT_HABILITE", message)
         hint = ""
-        if req.get("cdm_nom") and not self.collabs.get((req.get("cdm_email") or "").strip().lower()):
+        collabs = self.collabs if collabs is None else collabs
+        if req.get("cdm_nom") and not accounts.find_account(collabs, req.get("cdm_email"), req.get("cdm_nom")):
             hint = f"\n• Son chargé de mission ({req['cdm_nom']}) n'a pas de compte portail déclaré dans le service."
         self._notify(req, f":no_entry: *{req['client_name']}* (SIREN {req['siren']}) — "
                           f"{documents.DOCUMENT_TYPES[req['document_type']]['label']} {req['annee']} : "

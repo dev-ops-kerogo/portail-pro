@@ -18,8 +18,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
+import os
 import re
+import secrets
+import tempfile
 import threading
 import time
 import uuid
@@ -88,16 +92,116 @@ LOGIN_REFUSED = re.compile(r"mot de passe est incorrect|courriel et/ou votre mot
 MAINTENANCE = re.compile(r"maintenance|indisponible", re.I)
 
 
-# Identifiants refusés depuis le démarrage du service, tous threads confondus (worker, campagnes) : ils ne sont plus
-# jamais resoumis — y compris lors d'un renouvellement de jeton — tant que le service n'a pas été redémarré.
+# Identifiants refusés, tous threads confondus (worker, campagnes) : jamais resoumis — y compris lors d'un renouvellement
+# de jeton, ni après un redémarrage (conservés dans data/, sous forme d'empreinte HMAC : jamais le mot de passe). Un mot de
+# passe CORRIGÉ (Google Sheet ou .env) a une autre empreinte : il est essayé. Pour réessayer un mot de passe inchangé,
+# supprimer data/portail-identifiants-refuses.json.
 _REFUSED: set[tuple[str, str]] = set()
+_REFUSED_LOADED = False
+_KEY_LOCK = threading.Lock()
+_HMAC_KEY: bytes | None = None
 # Échecs de connexion consécutifs par identifiant (code de vérification demandé, portail en panne…), toutes sessions
 # confondues : une session neuve ne remet pas le compteur à zéro. → (nombre, heure du dernier échec)
 _FAILED: dict[tuple[str, str], tuple[int, float]] = {}
 
 
+def _private_write(path: Path, data: bytes) -> None:
+    """Écriture atomique et durable (fichier temporaire unique, fsync, remplacement), lisible par le seul utilisateur."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _hmac_key() -> bytes:
+    """Clé locale (data/, jamais dans le dépôt) des empreintes d'identifiants."""
+    global _HMAC_KEY
+    with _KEY_LOCK:
+        if _HMAC_KEY is None:
+            path = config.DATA_DIR / ".cle-empreintes"
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _private_write(path, secrets.token_hex(32).encode())
+            _HMAC_KEY = path.read_bytes().strip()
+        return _HMAC_KEY
+
+
 def _credentials_key(login: str | None, password: str | None) -> tuple[str, str]:
-    return (login or "", hashlib.sha256((password or "").encode("utf-8")).hexdigest())
+    """(identifiant normalisé, empreinte HMAC du mot de passe) : jamais le mot de passe lui-même."""
+    return ((login or "").strip().lower(), hmac.new(_hmac_key(), (password or "").encode("utf-8"), hashlib.sha256).hexdigest())
+
+
+def _refused_file() -> Path:
+    return config.DATA_DIR / "portail-identifiants-refuses.json"
+
+
+_REFUSED_STAMP: tuple | None = None   # (date de modification, taille) du fichier au dernier chargement
+
+
+def _load_refused() -> None:
+    """Ajoute à la mémoire les refus du fichier s'il a changé (autre processus : --test-compte, scripts de test).
+    Fichier illisible : mis de côté (jamais écrasé) et signalé."""
+    global _REFUSED_LOADED, _REFUSED_STAMP
+    path = _refused_file()
+    with _KEY_LOCK:
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            _REFUSED_LOADED = True
+            return
+        stamp = (st.st_mtime_ns, st.st_size)
+        if _REFUSED_LOADED and stamp == _REFUSED_STAMP:
+            return
+        _REFUSED_LOADED, _REFUSED_STAMP = True, stamp
+        try:
+            _REFUSED.update(tuple(x[:2]) for x in json.loads(path.read_text(encoding="utf-8")))
+        except Exception as e:
+            aside = path.with_name(f"{path.name}.illisible-{time.strftime('%Y%m%d-%H%M%S')}")
+            try:
+                path.rename(aside)
+            except OSError:
+                pass
+            log.error("Fichier des identifiants refusés illisible (%s) : mis de côté (%s). Les refus déjà en mémoire "
+                      "restent appliqués ; vérifier les comptes concernés.", type(e).__name__, aside.name)
+
+
+def is_refused(login: str | None, password: str | None) -> bool:
+    _load_refused()
+    return _credentials_key(login, password) in _REFUSED
+
+
+def mark_refused(login: str | None, password: str | None) -> None:
+    global _REFUSED_STAMP
+    key = _credentials_key(login, password)
+    _load_refused()   # union avec les refus notés entre-temps par un autre processus
+    with _KEY_LOCK:
+        _REFUSED.add(key)
+        try:
+            _private_write(_refused_file(), json.dumps(sorted(_REFUSED)).encode("utf-8"))
+            st = _refused_file().stat()
+            _REFUSED_STAMP = (st.st_mtime_ns, st.st_size)
+        except Exception as e:
+            log.warning("Impossible de mémoriser l'identifiant refusé sur le disque (%s)", type(e).__name__)
+
+
+# Une seule connexion à la fois par identifiant, tous threads confondus (worker + campagnes) : un mot de passe refusé
+# pendant qu'un autre thread attendait n'est jamais soumis une seconde fois (revérification sous le verrou).
+_LOGIN_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _login_lock(login: str | None) -> threading.Lock:
+    with _KEY_LOCK:
+        return _LOGIN_LOCKS.setdefault((login or "").strip().lower(), threading.Lock())
 
 
 def login_blocked_until(login: str | None, password: str | None) -> float | None:
@@ -217,10 +321,15 @@ class PortailPro:
                 self.rattachements[k] = qs[k][0]
 
     def login(self, timeout_s: int = 300) -> None:
-        """Ouvre le portail ; saisit les identifiants si le formulaire apparaît ; attend le premier jeton."""
-        if self.login_id and self.password and _credentials_key(self.login_id, self.password) in _REFUSED:
-            raise PortailLoginRefused("identifiants déjà refusés par le portail depuis le démarrage du service — "
-                                      "aucune nouvelle tentative (corriger .env puis redémarrer)")
+        """Ouvre le portail ; saisit les identifiants si le formulaire apparaît ; attend le premier jeton.
+        Une seule connexion à la fois par identifiant (tous threads) : les vérifications se font sous le verrou."""
+        with _login_lock(self.login_id):
+            self._login(timeout_s)
+
+    def _login(self, timeout_s: int) -> None:
+        if self.login_id and self.password and is_refused(self.login_id, self.password):
+            raise PortailLoginRefused("identifiants déjà refusés par le portail — aucune nouvelle tentative tant que le "
+                                      "mot de passe n'est pas corrigé (Google Sheet des accès ou .env)")
         until = login_blocked_until(self.login_id, self.password)
         if until:
             raise PortailLoginAbandoned(f"connexion suspendue jusqu'à {time.strftime('%H:%M', time.localtime(until))} après "
@@ -236,10 +345,21 @@ class PortailPro:
                 else:
                     self._fill_login_form()
             self._wait_token(timeout_s if not (self.login_id and self.password) else 90)
-        except Exception:
+        except Exception as e:
             _FAILED[key] = (_FAILED.get(key, (0, 0.0))[0] + 1, time.time())
-            raise
+            if isinstance(e, PortailProError):
+                raise
+            # Erreur du navigateur : son « Call log » recopie les saisies (fill("<mot de passe>")) → message nettoyé,
+            # exception d'origine NON chaînée (log.exception l'afficherait).
+            raise PortailProError(f"connexion impossible ({type(e).__name__}: {self._scrub(str(e))})") from None
         _FAILED.pop(key, None)
+
+    def _scrub(self, text: str) -> str:
+        """Message d'erreur sans journal d'appels Playwright ni mot de passe."""
+        text = text.split("Call log:")[0]
+        if self.password:
+            text = text.replace(self.password, "***")
+        return re.sub(r"\s+", " ", text).strip()[:300]
 
     def _login_form_visible(self, timeout_ms: int) -> bool:
         try:
@@ -330,25 +450,21 @@ class PortailPro:
             else:
                 pwd.press("Enter")
             # Connexion réussie dès qu'un jeton API est capturé ou que le formulaire a disparu (hors page de login).
-            deadline = time.time() + (60 if attempt == 3 else 25)
+            deadline = time.time() + 60   # un seul envoi par connexion : on lui laisse le temps d'aboutir
             while time.time() < deadline:
                 if self.token is not None:
                     return
                 if self._login_refused():
-                    _REFUSED.add(_credentials_key(self.login_id, self.password))
+                    mark_refused(self.login_id, self.password)
                     raise PortailLoginRefused("identifiant ou mot de passe refusé par le portail — aucune nouvelle "
                                               "tentative (plusieurs échecs peuvent bloquer le compte)")
                 if not self._login_form_visible(timeout_ms=1000) and not re.search(r"/ms/login", page.url):
                     return
                 page.wait_for_timeout(1000)
-            # formulaire toujours là : champs vidés = page rechargée pendant la saisie → on réessaie
-            try:
-                still_filled = bool(page.locator("input[type='password']").first.input_value())
-            except Exception:
-                still_filled = False
-            log.warning("portailpro : formulaire toujours affiché après la tentative %d (champs remplis : %s)", attempt, still_filled)
-            if still_filled and attempt >= 2:
-                break
+            # Formulaire toujours là après l'envoi : on ne renvoie JAMAIS le mot de passe dans la même connexion (un refus
+            # dont le message n'aurait pas été reconnu compterait double et rapprocherait le compte du blocage).
+            log.warning("portailpro : formulaire toujours affiché après l'envoi (tentative %d) : pas de nouvel envoi", attempt)
+            break
         shot = config.DATA_DIR / f"portail-echec-connexion-{time.strftime('%Y%m%d-%H%M%S')}.png"
         try:
             page.screenshot(path=str(shot), full_page=True)

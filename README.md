@@ -70,12 +70,26 @@ cp cabinets.example.json cabinets.json
   - *Production* : compte de service Google Workspace avec **délégation domain-wide** (scope
     `https://www.googleapis.com/auth/gmail.send`), fichier de clé dans `GOOGLE_SA_KEY_PATH`. Le service
     impersonne `sender_address` de chaque cabinet.
+- **Comptes portail des chargés de mission** (clients habilités sur le compte personnel du collaborateur) : essayés après
+  celui du cabinet. Source principale : un **Google Sheet des accès** (`CREDENTIALS_SHEET_ID`), colonnes « Mail de
+  connexion », « Mot de passe », « Chargé de mission », partagé **en lecture** avec le compte technique Google
+  (`CREDENTIALS_SA_KEY_PATH`) et relu toutes les `CREDENTIALS_REFRESH_S` secondes : nouveau compte ou mot de passe corrigé
+  pris en compte sans redémarrage. Rattachement au client par l'email du chargé de mission dans Salesforce, sinon par son
+  nom. Anomalies du Sheet (doublon, mot de passe manquant) et mots de passe refusés signalés dans le canal d'alertes ;
+  les mots de passe ne sont jamais écrits ni journalisés. Sans Google Sheet : `PORTAIL_COLLAB<n>_*` dans `.env` (voir
+  `.env.example`) ; avec un Sheet, ces identifiants ne sont plus utilisés (seul `ACTIF=false` compte), et tant que le
+  Sheet n'a jamais pu être lu, aucun client n'est déclaré « non habilité » (inventaires reportés).
+  Un mot de passe refusé par le portail n'est **plus jamais resoumis**, même après redémarrage (empreinte dans
+  `data/portail-identifiants-refuses.json`, jamais le mot de passe) : le corriger suffit ; pour réessayer un mot de passe
+  inchangé, supprimer ce fichier.
 
 ## 4. Vérifier brique par brique
 
 ```bash
 python app.py --test-sf "transport"              # recherche client Salesforce (nom ou début de SIREN)
 python app.py --test-portail Keobiz 123456789 # connexion au compte portail du cabinet + liste des avis
+python app.py --test-sheet                       # Google Sheet des accès : comptages seulement (aucun identifiant)
+python app.py --test-compte c.durand@keobiz.fr 123456789   # compte portail d'un chargé de mission + liste des avis
 python app.py --test-mysql                       # journal MySQL : crée la table, rejoue les demandes récentes
 python app.py                                     # lance le service (Slack + worker)
 ```

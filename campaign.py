@@ -16,12 +16,15 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import accounts
 import config
 import db
 import documents
 from config import Cabinet, PortalAccount
-from portailpro import (NonHabiliteError, PortailLoginAbandoned, PortailLoginRefused, PortailPro, PortailProError,
-                        login_blocked_until)
+import httpx
+
+from portailpro import (NonHabiliteError, PortailLoginAbandoned, PortailLoginRefused, PortailMaintenanceError, PortailPro,
+                        PortailProError, login_blocked_until)
 
 log = logging.getLogger("campaign")
 
@@ -33,6 +36,23 @@ ITEM_LABELS = {"FOUND": "Avis trouvé", "NO_DOCUMENT": "Aucun avis", "NO_EMAIL":
 # cabinet arrête l'inventaire et celui d'un chargé de mission est écarté (ses clients → « compte portail indisponible »).
 ERRORS_PAUSE, ERRORS_STOP = 5, 20
 LOGIN_STOPPED = (PortailLoginRefused, PortailLoginAbandoned)   # connexion à ne plus jamais retenter sur ce compte
+
+
+MAINTENANCE_PAUSE_S = 300        # portail en maintenance : nouvel essai du même client dans 5 min
+MAX_PAUSE_S = 6 * 3600           # au-delà de 6 h de pause cumulée, l'inventaire s'arrête
+
+
+class InventoryPause(Exception):
+    """Le portail ne peut pas être interrogé pour l'instant (maintenance, connexion du cabinet suspendue) : pause,
+    puis nouvel essai du MÊME client — ni erreur comptée, ni client mal classé."""
+
+    def __init__(self, until: float, reason: str):
+        super().__init__(reason)
+        self.until, self.reason = until, reason
+
+
+class SessionReopenError(PortailProError):
+    """Réouverture passagèrement impossible d'une session déjà connectée dans l'inventaire (erreur sur un client)."""
 
 
 class InventoryPortals:
@@ -58,12 +78,13 @@ class InventoryPortals:
         self.listing = False                      # listes demandées (grande campagne)
         self.errors: dict[str, int] = {}          # compte → erreurs consécutives
         self.requests = 0                         # interrogations list_avis faites pendant l'inventaire
+        self.opened: set[str] = set()             # comptes connectés au moins une fois dans cet inventaire
 
     def label(self, code: str) -> str:
         return self.accounts[code][1]
 
-    def cdm_account(self, cdm_email: str | None) -> PortalAccount | None:
-        return self.collabs.get((cdm_email or "").strip().lower())
+    def cdm_account(self, cdm_email: str | None, cdm_nom: str | None = None) -> PortalAccount | None:
+        return accounts.find_account(self.collabs, cdm_email, cdm_nom)
 
     def absent_from_list(self, code: str, siren: str) -> bool:
         """Le compte n'a pas accès au client d'après sa liste complète (conclusion fiable sans requête)."""
@@ -76,11 +97,12 @@ class InventoryPortals:
         self.errors[code] = self.errors.get(code, 0) + 1
         return self.errors[code]
 
-    def unverified(self, siren: str, cdm_email: str | None, answered: set[str]) -> list[tuple[str, str]]:
+    def unverified(self, siren: str, cdm_email: str | None, answered: set[str],
+                   cdm_nom: str | None = None) -> list[tuple[str, str]]:
         """(compte, raison) des comptes qui pourraient avoir accès au client sans l'avoir exclu (ni réponse « non
         habilité », ni liste complète sans ce SIREN) : compte écarté dont la liste contient le SIREN, cabinet / chargé de
         mission écarté et — en mode listes — tout compte dont la liste n'a pas pu être lue en entier."""
-        cdm = self.cdm_account(cdm_email)
+        cdm = self.cdm_account(cdm_email, cdm_nom)
         relevant = {self.cabinet.code} | ({cdm.code} if cdm else set())
         out = []
         for code in self.accounts:
@@ -109,13 +131,25 @@ class InventoryPortals:
             self.on_disabled(self.label(code), self.unusable[code])
 
     def session(self, code: str) -> PortailPro | None:
-        """Session du compte, ouverte au premier besoin ; None si écarté. Le compte du CABINET qui ne se connecte pas
-        interrompt l'inventaire (comportement historique) ; celui d'un chargé de mission est seulement écarté."""
+        """Session du compte, ouverte au premier besoin ; None si écarté. Première ouverture en échec : le compte du
+        CABINET interrompt l'inventaire (comportement historique), celui d'un chargé de mission est écarté. Réouverture
+        (session refermée par la limite de navigateurs) en échec passager : SessionReopenError, traitée comme une erreur
+        sur CE client (identifiants refusés ou connexion abandonnée : comme à la première ouverture)."""
         if code in self.unusable:
             return None
         if code in self.sessions:
+            self.sessions[code] = self.sessions.pop(code)   # ordre = du moins au plus récemment utilisé
             return self.sessions[code]
+        while len(self.sessions) >= max(1, config.PORTAIL_MAX_SESSIONS):   # navigateurs ouverts limités : on referme le
+            oldest = next((c for c in self.sessions if c != self.cabinet.code), None)   # moins récent, jamais le cabinet
+            if oldest is None:
+                break
+            try:
+                self.sessions.pop(oldest).close()   # son profil garde la connexion
+            except Exception:
+                pass
         kind, _, login, password = self.accounts[code]
+        reopening = code in self.opened
         p = None
         try:
             p = PortailPro(config.PROFILES_DIR / f"{code}-campagne", headless=config.PORTAIL_HEADLESS,
@@ -128,10 +162,13 @@ class InventoryPortals:
                     p.close()
                 except Exception:
                     pass
+            if reopening and not isinstance(e, LOGIN_STOPPED):
+                raise SessionReopenError(f"réouverture de la session impossible ({type(e).__name__}: {str(e)[:200]})") from None
             if kind == "cabinet":
                 raise
             self.disable(code, e)
             return None
+        self.opened.add(code)
         self.sessions[code] = p
         return p
 
@@ -139,16 +176,23 @@ class InventoryPortals:
         """Liste fraîche des entreprises de chaque compte (cabinet d'abord). should_stop() : campagne annulée → arrêt."""
         self.listing = True
         for code, (kind, label, _, _) in self.accounts.items():
+            if code in self.lists or code in self.list_errors or code in self.unusable:
+                continue   # déjà traité (reprise après une pause)
             if should_stop and should_stop():
                 return
-            p = self.session(code)
-            if p is None:
-                continue
             try:
+                p = self.session(code)
+                if p is None:
+                    continue
                 sirens, complete = p.list_habilitations(page_size=500, pause_s=config.CAMPAIGN_LIST_PAGE_INTERVAL_S,
                                                         max_pages=config.CAMPAIGN_LIST_MAX_PAGES, should_stop=should_stop)
+            except PortailMaintenanceError:
+                raise InventoryPause(time.time() + MAINTENANCE_PAUSE_S, "portail impots en maintenance") from None
             except LOGIN_STOPPED as e:
                 if kind == "cabinet":
+                    if isinstance(e, PortailLoginAbandoned):
+                        raise InventoryPause(e.until or time.time() + 3600,
+                                             "connexion du compte du cabinet suspendue après des échecs répétés") from None
                     raise
                 self.disable(code, e)
                 continue
@@ -173,11 +217,11 @@ class InventoryPortals:
                 parts.append(f"{self.label(code)} liste indisponible")
         return "listes : " + (" · ".join(parts) or "aucune")
 
-    def plan(self, siren: str, cdm_email: str | None) -> list[str]:
+    def plan(self, siren: str, cdm_email: str | None, cdm_nom: str | None = None) -> list[str]:
         """Comptes à interroger pour ce client, dans l'ordre : ceux dont la liste contient le SIREN (cabinet, chargé de
         mission, puis autres comptes déclarés), puis — sans liste fiable — le cabinet et le compte du chargé de mission.
         Liste vide = aucun compte n'a accès à ce client (conclusion sans requête)."""
-        cdm = self.cdm_account(cdm_email)
+        cdm = self.cdm_account(cdm_email, cdm_nom)
         order = [self.cabinet.code] + ([cdm.code] if cdm else []) + \
                 [a.code for a in self.collabs.values() if cdm is None or a.code != cdm.code]
         usable = [c for c in order if c not in self.unusable]
@@ -185,6 +229,14 @@ class InventoryPortals:
         relevant = [self.cabinet.code] + ([cdm.code] if cdm else [])
         blind = [c for c in relevant if c in usable and c not in listed and not self.complete.get(c, False)]
         return listed + blind
+
+    def drop_session(self, code: str) -> None:
+        p = self.sessions.pop(code, None)
+        if p is not None:
+            try:
+                p.close()
+            except Exception:
+                pass
 
     def close(self) -> None:
         for p in self.sessions.values():
@@ -198,8 +250,13 @@ REQ_LABELS = {"SENT": "Envoyé", "DRY_RUN": "Mode test", "NO_DOCUMENT": "Aucun d
 
 
 class CampaignManager:
-    def __init__(self, slack_client, sf, cabinets: dict[str, Cabinet], work_queue: queue.Queue):
+    def __init__(self, slack_client, sf, cabinets: dict[str, Cabinet], work_queue: queue.Queue, collabs_provider=None,
+                 accounts_unknown=None):
         self.slack, self.sf, self.cabinets, self.queue = slack_client, sf, cabinets, work_queue
+        # comptes des chargés de mission, relus (Google Sheet) au début de chaque inventaire ; « inconnus » tant que
+        # la source n'a jamais pu être lue (≠ aucun compte : l'inventaire est alors reporté)
+        self.collabs_provider = collabs_provider or (lambda: accounts.get_registry().current(force=True))
+        self.accounts_unknown = accounts_unknown or (lambda: accounts.get_registry().unknown)
         self._lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
 
@@ -238,12 +295,12 @@ class CampaignManager:
         try:
             # 1. sélection des clients
             if c["source"] == "sirens":
-                accounts = self.sf.get_accounts_by_sirens([x for x in (c["sirens"] or "").split() if x])
-                accounts = [a for a in accounts if a["entite"] == c["entite"]]
+                sf_accounts = self.sf.get_accounts_by_sirens([x for x in (c["sirens"] or "").split() if x])
+                sf_accounts = [a for a in sf_accounts if a["entite"] == c["entite"]]
             else:
-                accounts = self.sf.list_accounts_for_campaign(c["entite"], config.CAMPAIGN_SF_FILTER)
+                sf_accounts = self.sf.list_accounts_for_campaign(c["entite"], config.CAMPAIGN_SF_FILTER)
             seen, items = set(), []
-            for a in accounts:
+            for a in sf_accounts:
                 if a["id"] in seen or not a["siren"]:
                     continue
                 seen.add(a["id"])
@@ -256,29 +313,48 @@ class CampaignManager:
             self._update(c["slack_channel"], ts, f":mag: {title}\nInventaire : {total} clients sélectionnés, interrogation du portail en cours…")
 
             # 2. comptes portail : cabinet + chargés de mission déclarés ; listes fraîches si la campagne est assez grande
-            portals = InventoryPortals(cabinet, config.load_collab_accounts(), on_disabled=lambda label, reason: self._post(
+            collabs = self.collabs_provider()
+            if self.accounts_unknown():
+                raise RuntimeError("Google Sheet des accès illisible : comptes portail des chargés de mission inconnus — "
+                                   "inventaire reporté, relancez-le quand le Sheet est de nouveau lisible")
+            portals = InventoryPortals(cabinet, collabs, on_disabled=lambda label, reason: self._post(
                 c["slack_channel"], f":warning: Campagne `{campaign_id}` : compte portail de *{label}* écarté pour cet "
                                     f"inventaire ({reason}). Les clients non trouvés ailleurs et que ce compte pourrait "
                                     f"voir seront classés « {ITEM_LABELS['COMPTE_INDISPONIBLE'].lower()} »."))
             cancelled = lambda: (db.get_campaign(campaign_id) or {}).get("status") == "CANCELLED"   # noqa: E731
             portals.session(cabinet.code)   # connexion du cabinet : un échec interrompt l'inventaire
+            paused = 0.0                     # pauses cumulées (maintenance du portail, connexion du cabinet suspendue)
             if total >= config.CAMPAIGN_LIST_MIN_CLIENTS:
                 self._update(c["slack_channel"], ts, f":mag: {title}\nInventaire : {total} clients sélectionnés, "
                                                       f"récupération des listes d'entreprises de chaque compte portail…")
-                portals.fetch_lists(should_stop=cancelled)
+                while True:   # pause (maintenance, connexion du cabinet suspendue) puis reprise là où on en était
+                    try:
+                        portals.fetch_lists(should_stop=cancelled)
+                        break
+                    except InventoryPause as pz:
+                        paused = self._pause(c, ts, title, pz, paused, cancelled)
                 mode = portals.lists_summary()
             else:
                 mode = "petite campagne : interrogation directe (cabinet puis chargé de mission)"
             log.info("Campagne %s — %s", campaign_id, mode)
             self._update(c["slack_channel"], ts, f":mag: {title}\nInventaire : {total} clients — {mode}. Interrogation en cours…")
 
-            # 3. interrogation du portail, un client à la fois, sur le bon compte
+            # 3. interrogation du portail, un client à la fois, sur le bon compte — clients regroupés par compte à
+            #    à interroger (clients sans requête d'abord), pour ouvrir chaque navigateur le moins souvent possible
+            rank = {code: i for i, code in enumerate(portals.accounts)}
+            pending = sorted(db.list_campaign_items(campaign_id, "PENDING"), key=lambda it: (
+                tuple(rank[k] for k in portals.plan(it["siren"], it.get("cdm_email"), it.get("cdm_nom"))) or (-1,), it["id"]))
             done, last_update = 0, time.time()
-            for it in db.list_campaign_items(campaign_id, "PENDING"):
-                if cancelled():
-                    self._update(c["slack_channel"], ts, f":no_entry_sign: {title}\nInventaire annulé après {done}/{total} clients.")
-                    return
-                status, avis_count, montant, detail, compte = self._inventory_one(portals, c, it)
+            for it in pending:
+                while True:
+                    if cancelled():
+                        self._update(c["slack_channel"], ts, f":no_entry_sign: {title}\nInventaire annulé après {done}/{total} clients.")
+                        return
+                    try:
+                        status, avis_count, montant, detail, compte = self._inventory_one(portals, c, it)
+                        break
+                    except InventoryPause as pz:   # ni erreur comptée, ni client mal classé : pause puis même client
+                        paused = self._pause(c, ts, title, pz, paused, cancelled)
                 db.update_campaign_item(it["id"], status=status, avis_count=avis_count, montant_total=montant, detail=detail,
                                         portail_compte=compte if status in ("FOUND", "NO_DOCUMENT") else None)
                 done += 1
@@ -330,6 +406,20 @@ class CampaignManager:
             if portals is not None:
                 portals.close()
 
+    def _pause(self, c: dict, ts: str | None, title: str, pz: InventoryPause, paused: float, cancelled) -> float:
+        """Attend la fin de la pause (annulation vérifiée toutes les 30 s) ; renvoie le cumul des pauses. Au-delà de
+        MAX_PAUSE_S cumulées, l'inventaire s'arrête (RuntimeError)."""
+        wait = max(30.0, pz.until - time.time())
+        if paused + wait > MAX_PAUSE_S:
+            raise RuntimeError(f"inventaire en pause depuis trop longtemps ({pz.reason}) — à relancer plus tard")
+        log.warning("Campagne %s : pause de %d min (%s)", c["campaign_id"], wait // 60, pz.reason)
+        self._update(c["slack_channel"], ts, f":double_vertical_bar: {title}\nInventaire en pause : {pz.reason} — "
+                                              f"reprise vers {datetime.fromtimestamp(time.time() + wait):%H:%M}.")
+        end = time.time() + wait
+        while time.time() < end and not cancelled():
+            time.sleep(max(0.0, min(30.0, end - time.time())))
+        return paused + wait
+
     def _inventory_one(self, portals: InventoryPortals, c: dict, it: dict) -> tuple[str, int | None, float | None, str, str | None]:
         """(statut, nb avis, montant, détail, compte portail où le document a été trouvé)."""
         if not it["client_email"] or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", it["client_email"]):
@@ -339,18 +429,23 @@ class CampaignManager:
             return "ALREADY_SENT", None, None, f"Envoyé le {(prev['sent_at'] or '')[:10]} par {prev['slack_user_name'] or '?'}", None
         siren = it["siren"]
         answered: list[str] = []   # comptes interrogés qui ont répondu « non habilité »
-        for code in portals.plan(siren, it.get("cdm_email")):
-            p = portals.session(code)
-            if p is None:   # compte écarté entre-temps
-                continue
-            time.sleep(config.CAMPAIGN_INVENTORY_INTERVAL_S)   # politesse avant CHAQUE requête (aucune si client classé d'après les listes)
-            portals.requests += 1
+        for code in portals.plan(siren, it.get("cdm_email"), it.get("cdm_nom")):
             label = portals.label(code)
             try:
+                p = portals.session(code)   # réouverture en échec passager → erreur sur ce client (SessionReopenError)
+                if p is None:   # compte écarté (entre-temps, ou connexion impossible à la première ouverture)
+                    continue
+                time.sleep(config.CAMPAIGN_INVENTORY_INTERVAL_S)   # politesse avant CHAQUE requête (aucune si client classé d'après les listes)
+                portals.requests += 1
                 avis = [a for a in p.list_avis(siren) if a.is_cfe and a.annee == c["annee"]]
+            except PortailMaintenanceError:   # tout le portail est concerné : pause, puis ce même client
+                raise InventoryPause(time.time() + MAINTENANCE_PAUSE_S, "portail impots en maintenance") from None
             except LOGIN_STOPPED as e:
                 if code == portals.cabinet.code:
-                    raise   # connexion du cabinet perdue : arrêt de l'inventaire, jamais retentée client après client
+                    if isinstance(e, PortailLoginAbandoned):   # suspension temporaire : pause jusqu'à la reprise
+                        raise InventoryPause(e.until or time.time() + 3600,
+                                             "connexion du compte du cabinet suspendue après des échecs répétés") from None
+                    raise   # mot de passe du cabinet refusé : arrêt de l'inventaire, jamais resoumis client après client
                 portals.disable(code, e)
                 continue
             except NonHabiliteError:   # ce compte n'a pas accès au client : pas une erreur technique
@@ -358,6 +453,8 @@ class CampaignManager:
                 answered.append(code)
                 continue
             except Exception as e:
+                if not isinstance(e, (PortailProError, httpx.HTTPError)):
+                    portals.drop_session(code)   # erreur du navigateur : session rouverte proprement au prochain besoin
                 n = portals.record_error(code)
                 msg = f"{label} : {e}" if isinstance(e, PortailProError) else f"{label} : {type(e).__name__}: {e}"
                 if code != portals.cabinet.code and n >= ERRORS_STOP:
@@ -373,7 +470,7 @@ class CampaignManager:
         # Personne n'a fourni l'avis : « aucun compte habilité » seulement si chaque compte qui pourrait avoir accès l'a exclu.
         names = lambda codes: ", ".join(portals.label(k) for k in codes)   # noqa: E731
         no = f" — non habilité(s) : {names(answered)}" if answered else ""
-        unverified = portals.unverified(siren, it.get("cdm_email"), set(answered))
+        unverified = portals.unverified(siren, it.get("cdm_email"), set(answered), it.get("cdm_nom"))
         if unverified:
             return ("COMPTE_INDISPONIBLE", None, None,
                     ("Client non vérifié sur : " + "; ".join(f"{portals.label(k)} ({why})" for k, why in unverified)
@@ -384,7 +481,7 @@ class CampaignManager:
         absent = [k for k in portals.accounts if k not in answered and portals.absent_from_list(k, siren)]
         if absent:
             why.append("absent des listes de : " + names(absent))
-        cdm = portals.cdm_account(it.get("cdm_email"))
+        cdm = portals.cdm_account(it.get("cdm_email"), it.get("cdm_nom"))
         text = "Aucun compte habilité" + (" (" + " ; ".join(why) + ")" if why else "")
         if cdm is None and it.get("cdm_nom"):
             text += f" — {it['cdm_nom']} n'a pas de compte portail déclaré"

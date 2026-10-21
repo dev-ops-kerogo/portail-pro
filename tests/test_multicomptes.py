@@ -5,6 +5,7 @@ Lancer :  .venv/bin/python -m unittest discover -s tests -v
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
 import sys
@@ -31,6 +32,10 @@ from portailpro import (_FAILED, _REFUSED, LOGIN_COOLDOWN_S, MAX_FAILED_LOGINS, 
                         PortailProError, _credentials_key, extract_pdf, json_or_maintenance, non_habilite_message)
 
 assert str(config.DB_PATH).startswith(_TMP), "les tests doivent utiliser une base temporaire"
+# Jamais le vrai Google Sheet des accès ni les comptes du .env réel pendant les tests.
+config.CREDENTIALS_SHEET_ID = None
+import accounts  # noqa: E402
+accounts._REGISTRY = accounts.AccountRegistry(None, load_env=lambda: {}, disabled_env=set)
 db.init_db()
 
 NON_HABILITE_JSON = {"resultat": [], "infos": [{"infoCode": "131105", "infoMessage": "Vous n'êtes pas habilité à voir cette fonctionnalité",
@@ -189,6 +194,56 @@ class IdentifiantsRefuses(unittest.TestCase):
             self.assertEqual(len(visits), MAX_FAILED_LOGINS + 1)
         finally:
             _FAILED.pop(key, None)
+
+    def test_mot_de_passe_jamais_dans_une_erreur_du_navigateur(self):
+        p = object.__new__(PortailPro)
+        p.login_id, p.password, p.token = "fuite@keobiz.fr", 'Secr"et-42', None
+        p.page = type("Page", (), {"goto": lambda self, *a, **k: None})()
+        p._login_form_visible = lambda timeout_ms: True
+
+        def fill():   # Playwright recopie la saisie dans le « Call log » de son exception
+            raise TimeoutError(f'Timeout 30000ms exceeded.\nCall log:\n  - fill("{p.password}")\n  - waiting for element')
+        p._fill_login_form = fill
+        key = _credentials_key(p.login_id, p.password)
+        try:
+            with self.assertRaises(PortailProError) as ctx:
+                p.login()
+        finally:
+            _FAILED.pop(key, None)
+        self.assertNotIn("Secr", str(ctx.exception))
+        self.assertIn("TimeoutError", str(ctx.exception))
+        self.assertTrue(ctx.exception.__suppress_context__)   # exception d'origine non affichée par log.exception
+
+    def test_refus_memorises_apres_redemarrage_sans_mot_de_passe_sur_le_disque(self):
+        import portailpro
+        portailpro.mark_refused("Refus.Disque@keobiz.fr", "mauvais-mdp-unique")
+        stored = portailpro._refused_file().read_text(encoding="utf-8")
+        self.assertNotIn("mauvais-mdp-unique", stored)
+        self.assertEqual(oct(portailpro._refused_file().stat().st_mode & 0o777), "0o600")
+        saved = set(_REFUSED)
+        _REFUSED.clear(); portailpro._REFUSED_LOADED = False                  # « redémarrage »
+        try:
+            self.assertTrue(portailpro.is_refused("refus.disque@KEOBIZ.fr ", "mauvais-mdp-unique"))   # casse ignorée
+            self.assertFalse(portailpro.is_refused("refus.disque@keobiz.fr", "mot-de-passe-corrige"))
+        finally:
+            _REFUSED.update(saved)
+
+    def test_refus_note_par_un_autre_processus_pris_en_compte(self):
+        import portailpro
+        portailpro._load_refused()
+        other = set(_REFUSED) | {_credentials_key("autre.processus@keobiz.fr", "pw-refuse")}
+        time.sleep(0.01)
+        portailpro._private_write(portailpro._refused_file(), json.dumps(sorted(other)).encode())   # ex. --test-compte
+        self.assertTrue(portailpro.is_refused("autre.processus@keobiz.fr", "pw-refuse"))
+
+    def test_fichier_des_refus_illisible_mis_de_cote_jamais_ecrase(self):
+        import portailpro
+        path = portailpro._refused_file()
+        path.write_text("{pas du json", encoding="utf-8")
+        portailpro._REFUSED_STAMP = None
+        self.assertFalse(portailpro.is_refused("x@keobiz.fr", "y"))
+        self.assertFalse(path.exists())
+        self.assertTrue(list(path.parent.glob(path.name + ".illisible-*")))
 
     def test_connexion_reussie_remet_le_compteur_a_zero(self):
         key = _credentials_key("ok@keobiz.fr", "bon")
@@ -743,9 +798,32 @@ class Campagne(unittest.TestCase):
         status, *_ = self.cm._inventory_one(p, self.C, self.item())
         self.assertEqual(status, "COMPTE_INDISPONIBLE")
         self.assertIn("collab-c.durand", p.unusable)
-        p = make_portals({"Keobiz": FakeListPortail(PortailLoginAbandoned("2 échecs"))})
-        with self.assertRaises(PortailLoginAbandoned):
+        import campaign
+        p = make_portals({"Keobiz": FakeListPortail(PortailLoginAbandoned("2 échecs", until=time.time() + 600))})
+        with self.assertRaises(campaign.InventoryPause) as ctx:                  # cabinet suspendu : pause, pas d'arrêt
             self.cm._inventory_one(p, self.C, self.item())
+        self.assertGreater(ctx.exception.until, time.time() + 500)
+        p = make_portals({"Keobiz": FakeListPortail(PortailLoginRefused("refusé"))})
+        with self.assertRaises(PortailLoginRefused):                             # cabinet refusé : arrêt
+            self.cm._inventory_one(p, self.C, self.item())
+
+    def test_maintenance_pause_sans_erreur_comptee(self):
+        import campaign
+        p = make_portals({"Keobiz": FakeListPortail(PortailMaintenanceError("maintenance"))})
+        with self.assertRaises(campaign.InventoryPause):
+            self.cm._inventory_one(p, self.C, self.item())
+        self.assertNotIn("Keobiz", p.errors)
+
+    def test_erreur_du_navigateur_session_refermee(self):
+        cab = FakeListPortail(RuntimeError("Target page, context or browser has been closed"))
+        cab.closed = False
+        cab.close = lambda: setattr(cab, "closed", True)
+        p = make_portals({"Keobiz": cab})
+        p.sessions["Keobiz"] = cab
+        status, *_ = self.cm._inventory_one(p, self.C, self.item())
+        self.assertEqual(status, "ERROR")
+        self.assertTrue(cab.closed)
+        self.assertNotIn("Keobiz", p.sessions)                                   # rouverte au prochain client
 
 
 class ListeHabilitations(unittest.TestCase):
@@ -931,22 +1009,22 @@ class InventaireComplet(unittest.TestCase):
     def setUp(self):
         import campaign
         self.campaign = campaign
-        self.saved = (campaign.PortailPro, config.load_collab_accounts, config.CAMPAIGN_INVENTORY_INTERVAL_S,
+        self.saved = (campaign.PortailPro, config.CAMPAIGN_INVENTORY_INTERVAL_S,
                       config.CAMPAIGN_LIST_MIN_CLIENTS, config.CAMPAIGN_LIST_PAGE_INTERVAL_S)
         campaign.PortailPro = FakeInventoryPortail
-        config.load_collab_accounts = lambda: {CAMILLE.email: CAMILLE}
         config.CAMPAIGN_INVENTORY_INTERVAL_S, config.CAMPAIGN_LIST_MIN_CLIENTS, config.CAMPAIGN_LIST_PAGE_INTERVAL_S = 0, 0, 0
         FakeInventoryPortail.LISTS = {"x": {"111111111"}, "v": {"222222222"}}   # identifiants : cabinet « x », Camille « v »
         FakeInventoryPortail.calls, FakeInventoryPortail.on_list = [], None
         cab = config.Cabinet(code="Keobiz", libelle="Keobiz", portal_login="x", portal_password="y",
                              sender_address="contact@exemple.fr", reply_to="contact@exemple.fr", signature_html="")
-        self.cm = CampaignManager(FakeSlack(), FakeSF(self.SIRENS), {"Keobiz": cab}, queue.Queue())
+        self.cm = CampaignManager(FakeSlack(), FakeSF(self.SIRENS), {"Keobiz": cab}, queue.Queue(),
+                                  collabs_provider=lambda: {CAMILLE.email: CAMILLE})
         self.cid = db.create_campaign({"created_by": "U1", "created_by_name": "testeur", "entite": "Keobiz",
                                        "document_type": "CFE", "annee": "2025", "source": "sirens",
                                        "sirens": "\n".join(self.SIRENS), "send_limit": None, "slack_channel": "CAMP"})
 
     def tearDown(self):
-        (self.campaign.PortailPro, config.load_collab_accounts, config.CAMPAIGN_INVENTORY_INTERVAL_S,
+        (self.campaign.PortailPro, config.CAMPAIGN_INVENTORY_INTERVAL_S,
          config.CAMPAIGN_LIST_MIN_CLIENTS, config.CAMPAIGN_LIST_PAGE_INTERVAL_S) = self.saved
 
     def statuses(self):
@@ -967,6 +1045,34 @@ class InventaireComplet(unittest.TestCase):
         self.assertIn(("avis", "x", "111111111"), avis)   # cabinet interrogé directement, malgré sa liste vide
         self.assertIn(("avis", "x", "999999999"), avis)
         self.assertEqual(self.statuses()["222222222"], ("FOUND", "collab-c.durand"))
+
+    def test_comptes_inconnus_inventaire_reporte(self):
+        self.cm.accounts_unknown = lambda: True
+        self.cm._run_inventory(self.cid)
+        c = db.get_campaign(self.cid)
+        self.assertEqual(c["status"], "FAILED")
+        self.assertIn("Google Sheet des accès illisible", c["message"])
+        self.assertEqual(FakeInventoryPortail.calls, [])                         # aucune requête portail
+
+    def test_maintenance_pendant_l_inventaire_pause_puis_meme_client(self):
+        state = {"n": 0}
+        original = FakeInventoryPortail.list_avis
+
+        def flaky(portail, siren):
+            state["n"] += 1
+            if state["n"] == 1:
+                raise PortailMaintenanceError("maintenance")
+            return original(portail, siren)
+        FakeInventoryPortail.list_avis = flaky
+        pauses = []
+        self.cm._pause = lambda c, ts, title, pz, paused, cancelled: (pauses.append(pz.reason), paused)[1]
+        try:
+            self.cm._run_inventory(self.cid)
+        finally:
+            FakeInventoryPortail.list_avis = original
+        self.assertEqual(pauses, ["portail impots en maintenance"])
+        self.assertEqual(db.get_campaign(self.cid)["status"], "INVENTORY_DONE")
+        self.assertEqual(self.statuses()["111111111"], ("FOUND", "Keobiz"))     # le client en pause a bien été retraité
 
     def test_annulation_pendant_la_lecture_des_listes(self):
         FakeInventoryPortail.on_list = lambda login: db.update_campaign(self.cid, status="CANCELLED")
@@ -995,6 +1101,339 @@ class EnvoiCampagne(unittest.TestCase):
         self.assertEqual([a[2] for a in w._accounts_for(req, cabinet)], ["collab-c.durand", "Keobiz"])
         req["portail_compte"] = "Keobiz"           # trouvé sur le cabinet : ordre habituel
         self.assertEqual([a[2] for a in w._accounts_for(req, cabinet)], ["Keobiz", "collab-c.durand"])
+
+
+# ---------------------------------------------------------------------------------------------- Google Sheet des accès
+HEADER = ["Manager", "Chargé de mission", "Mail de connexion", "Mot de passe"]
+
+
+def acc(email, pw="secret-1", nom="", source=accounts.SOURCE_SHEET):
+    return config.PortalAccount(code=config.collab_code(email), nom=nom, email=email, login=email, password=pw, source=source)
+
+
+class LectureSheet(unittest.TestCase):
+    def test_lignes_valides_et_remarques_sans_mot_de_passe(self):
+        rows = [HEADER,
+                ["Paul", "Camille DURAND", "C.Durand@keobiz.fr ", "secret-1"],
+                ["Paul"],                                                        # ligne « manager » seule
+                [],
+                ["Paul", "Alex MARTIN", "a.martin@keobiz.fr", ""],               # mot de passe manquant
+                ["Paul", "Sans Mail", "", "secret-2"],                           # mail manquant
+                ["Paul", "Camille DURAND", "c.durand@keobiz.fr", "secret-3"]]    # doublon : la dernière ligne compte
+        found, notes = accounts.parse_rows(rows)
+        self.assertEqual(list(found), ["c.durand@keobiz.fr"])
+        a = found["c.durand@keobiz.fr"]
+        self.assertEqual((a.password, a.nom, a.code, a.source), ("secret-3", "Camille DURAND", "collab-c.durand", "Google Sheet"))
+        self.assertEqual(len(notes), 3)
+        self.assertTrue(any("mot de passe manquant" in n for n in notes))
+        self.assertTrue(any("lignes 2, 7" in n for n in notes))
+        joined = " ".join(notes) + repr(a)
+        for pw in ("secret-1", "secret-2", "secret-3"):
+            self.assertNotIn(pw, joined)                                         # jamais un mot de passe
+
+    def test_intitules_insensibles_a_la_casse_et_aux_accents(self):
+        found, _ = accounts.parse_rows([["MOT DE PASSE", "mail de connexion ", "CHARGE DE MISSION", "Actif"],
+                                        ["pw", "x.y@keobiz.fr", "X Y", "oui"], ["pw", "z.z@keobiz.fr", "Z Z", "non"]])
+        self.assertEqual(list(found), ["x.y@keobiz.fr"])                        # « Actif = non » ignoré
+
+    def test_mot_de_passe_colle_dans_la_cellule_du_mail_jamais_recopie(self):
+        rows = [HEADER, ["", "Camille DURAND", "c.durand@keobiz.fr;Azerty123!", ""],
+                ["", "", "b@keobiz.fr:Secret-42", "pw"]]
+        found, notes = accounts.parse_rows(rows)
+        self.assertEqual(found, {})
+        self.assertNotIn("Azerty", " ".join(notes))
+        self.assertNotIn("Secret", " ".join(notes))
+        self.assertTrue(any("ligne 2 (Camille DURAND) : mail de connexion absent ou invalide" in n for n in notes))
+
+    def test_case_actif_decochee_ou_desactivee(self):
+        for value in ("FAUX", "False", "Désactivée", "Inactive", "N"):
+            found, _ = accounts.parse_rows([HEADER + ["Actif"], ["", "", "a@keobiz.fr", "pw", value]])
+            self.assertEqual(found, {}, value)
+
+    def test_doublon_la_ligne_la_plus_basse_coupe_le_compte(self):
+        rows = [HEADER + ["Actif"], ["", "C D", "c.d@keobiz.fr", "ancien", "oui"], ["", "C D", "c.d@keobiz.fr", "nouveau", "non"]]
+        found, notes = accounts.parse_rows(rows)
+        self.assertEqual(found, {})                                            # jamais de retour à l'ancien mot de passe
+        self.assertTrue(any("coupe le compte" in n for n in notes))
+        found, _ = accounts.parse_rows([HEADER, ["", "", "c.d@keobiz.fr", "ancien"], ["", "", "c.d@keobiz.fr", ""]])
+        self.assertEqual(found, {})                                            # mot de passe effacé en bas : coupé
+
+    def test_colonnes_obligatoires(self):
+        with self.assertRaises(ValueError):
+            accounts.parse_rows([["Manager", "Chargé de mission", "Mail de connexion"]])
+        with self.assertRaises(ValueError):
+            accounts.parse_rows([])
+
+    def test_rattachement_par_mail_puis_par_nom(self):
+        collabs = {"c.durand@keobiz.fr": acc("c.durand@keobiz.fr", nom="Camille DURAND"),
+                   "dupont1@keobiz.fr": acc("dupont1@keobiz.fr", nom="Jean Dupont"),
+                   "dupont2@keobiz.fr": acc("dupont2@keobiz.fr", nom="DUPONT Jean")}
+        self.assertEqual(accounts.find_account(collabs, " C.DURAND@keobiz.fr").email, "c.durand@keobiz.fr")
+        self.assertEqual(accounts.find_account(collabs, "autre@keobiz.fr", "DURAND Camille").email, "c.durand@keobiz.fr")
+        self.assertEqual(accounts.find_account(collabs, "autre@keobiz.fr", "Camille Durand").email, "c.durand@keobiz.fr")
+        self.assertIsNone(accounts.find_account(collabs, "autre@keobiz.fr", "Jean Dupont"))   # ambigu : aucun
+        self.assertIsNone(accounts.find_account(collabs, "autre@keobiz.fr", ""))
+
+
+class RegistreComptes(unittest.TestCase):
+    def registry(self, rows, env=None, disabled=()):
+        notices = []
+        state = {"rows": rows, "reads": 0}
+
+        def fetch():
+            state["reads"] += 1
+            if isinstance(state["rows"], Exception):
+                raise state["rows"]
+            return state["rows"]
+        reg = accounts.AccountRegistry(fetch, load_env=lambda: dict(env or {}), disabled_env=lambda: set(disabled),
+                                       refresh_s=3600, on_notice=notices.append)
+        return reg, state, notices
+
+    def test_sheet_seule_source_des_qu_il_est_lu_et_desactivation_env(self):
+        env = {"c.durand@keobiz.fr": acc("c.durand@keobiz.fr", "ancien", source=".env"),
+               "seul.env@keobiz.fr": acc("seul.env@keobiz.fr", source=".env")}
+        rows = [HEADER, ["", "", "c.durand@keobiz.fr", "nouveau"], ["", "", "desactive@keobiz.fr", "pw"]]
+        reg, _, _ = self.registry(rows, env, disabled={"desactive@keobiz.fr"})
+        cur = reg.current()
+        self.assertEqual(cur["c.durand@keobiz.fr"].password, "nouveau")
+        self.assertNotIn("seul.env@keobiz.fr", cur)                            # le .env ne sert plus
+        self.assertNotIn("desactive@keobiz.fr", cur)                           # désactivé dans .env : le reste
+
+    def test_ligne_coupee_dans_le_sheet_jamais_de_retour_a_l_ancien_mot_de_passe(self):
+        env = {"c.durand@keobiz.fr": acc("c.durand@keobiz.fr", "ancien", source=".env")}
+        rows = [HEADER, ["", "", "c.durand@keobiz.fr", "nouveau"]] + [["", "", f"x{i}@keobiz.fr", "pw"] for i in range(4)]
+        reg, state, _ = self.registry(rows, env)
+        reg.current()
+        state["rows"] = [HEADER, ["", "", "c.durand@keobiz.fr", "", ]] + rows[2:]    # mot de passe effacé
+        self.assertNotIn("c.durand@keobiz.fr", reg.current(force=True))
+        state["rows"] = [HEADER + ["Actif"], ["", "", "c.durand@keobiz.fr", "nouveau", "non"]] + rows[2:]
+        self.assertNotIn("c.durand@keobiz.fr", reg.current(force=True))
+
+    def test_desactivation_env_par_identifiant_meme_si_email_sf_different(self):
+        rows = [HEADER, ["", "", "jdupont.perso@exemple.fr", "pw"]]
+        reg, _, _ = self.registry(rows, disabled={"j.dupont@keobiz.fr", "jdupont.perso@exemple.fr"})
+        self.assertEqual(reg.current(), {})
+        os.environ.update({"PORTAIL_COLLAB9_LOGIN": "JDupont.Perso@exemple.fr", "PORTAIL_COLLAB9_EMAIL_SF": "j.dupont@keobiz.fr",
+                           "PORTAIL_COLLAB9_ACTIF": "false"})
+        try:
+            self.assertTrue({"j.dupont@keobiz.fr", "jdupont.perso@exemple.fr"} <= config.disabled_collab_emails())
+        finally:
+            for k in ("PORTAIL_COLLAB9_LOGIN", "PORTAIL_COLLAB9_EMAIL_SF", "PORTAIL_COLLAB9_ACTIF"):
+                os.environ.pop(k, None)
+
+    def test_chute_brutale_comptes_conserves_puis_acceptee_si_elle_dure(self):
+        full = [HEADER] + [["", "", f"c{i}@keobiz.fr", "pw"] for i in range(10)]
+        reg, state, notices = self.registry(full)
+        self.assertEqual(len(reg.current()), 10)
+        state["rows"] = [HEADER]                                               # Sheet vidé
+        for _ in range(5):                                                     # relectures forcées rapprochées :
+            self.assertEqual(len(reg.current(force=True)), 10)                 # derniers comptes conservés
+        self.assertEqual(sum("baisse suspecte" in n for n in notices), 1)      # une seule alerte
+        reg._drop_since -= accounts.DROP_CONFIRM_S                             # une heure plus tard
+        self.assertEqual(len(reg.current(force=True)), 0)                      # baisse persistante : acceptée
+        self.assertTrue(any("baisse confirmée" in n for n in notices))
+
+    def test_baisse_survenue_pendant_un_arret_signalee(self):
+        count_file = Path(_TMP) / "comptes-test-arret.json"
+        count_file.write_text('{"comptes": 30}', encoding="utf-8")
+        notices = []
+        reg = accounts.AccountRegistry(lambda: [HEADER, ["", "", "a@keobiz.fr", "pw"]], load_env=dict, disabled_env=set,
+                                       on_notice=notices.append, count_file=count_file)
+        self.assertEqual(len(reg.current()), 1)
+        self.assertTrue(any("avant le redémarrage" in n for n in notices))
+        self.assertEqual(json.loads(count_file.read_text())["comptes"], 1)
+
+    def test_changements_de_comptes_signales_sans_mot_de_passe(self):
+        reg, state, notices = self.registry([HEADER, ["", "", "a@keobiz.fr", "pw-un"], ["", "", "b@keobiz.fr", "pw-b"]])
+        reg.current()
+        state["rows"] = [HEADER, ["", "", "a@keobiz.fr", "pw-deux"], ["", "", "b@keobiz.fr", "pw-b"], ["", "", "c@keobiz.fr", "pw-c"]]
+        reg.current(force=True)
+        note = next(n for n in notices if "mis à jour" in n)
+        self.assertIn("ajoutés : c@keobiz.fr", note)
+        self.assertIn("mot de passe modifié : a@keobiz.fr", note)
+        for pw in ("pw-un", "pw-deux", "pw-b", "pw-c"):
+            self.assertNotIn(pw, " ".join(notices))
+
+    def test_relecture_espacee_et_sur_demande(self):
+        reg, state, _ = self.registry([HEADER, ["", "", "a@keobiz.fr", "pw"]])
+        reg.current(); reg.current()
+        self.assertEqual(state["reads"], 1)                                    # pas de relecture avant refresh_s
+        reg.current(force=True)
+        self.assertEqual(state["reads"], 2)
+
+    def test_sheet_illisible_derniers_comptes_conserves_une_seule_alerte(self):
+        reg, state, notices = self.registry([HEADER, ["", "", "a@keobiz.fr", "pw"]])
+        self.assertIn("a@keobiz.fr", reg.current())
+        state["rows"] = RuntimeError("HTTP 403")
+        self.assertIn("a@keobiz.fr", reg.current(force=True))                 # conservé
+        reg.current(force=True)
+        self.assertEqual(sum("illisible" in n for n in notices), 1)            # une seule alerte
+        state["rows"] = [HEADER, ["", "", "a@keobiz.fr", "pw"]]
+        reg.current(force=True)
+        self.assertTrue(any("de nouveau lisible" in n for n in notices))
+
+    def test_sheet_illisible_des_le_depart_comptes_inconnus(self):
+        reg, _, notices = self.registry(RuntimeError("HTTP 404"), env={"e@keobiz.fr": acc("e@keobiz.fr", source=".env")})
+        self.assertEqual(reg.current(), {})                                    # jamais les mots de passe du .env
+        self.assertTrue(reg.unknown)                                           # comptes INCONNUS, pas « aucun compte »
+        self.assertTrue(any("inconnus" in n for n in notices))
+
+    def test_remarques_signalees_une_fois_tant_qu_elles_ne_changent_pas(self):
+        rows = [HEADER, ["", "Sans MDP", "a@keobiz.fr", ""]]
+        reg, _, notices = self.registry(rows)
+        reg.current(); reg.current(force=True); reg.current(force=True)
+        self.assertEqual(sum("à corriger" in n for n in notices), 1)
+
+
+class FakeSession:
+    """Session portail factice pour le worker : garde ses identifiants, compte les fermetures."""
+    created: list = []
+
+    def __init__(self, profile_dir, headless=True, channel=None, login=None, password=None):
+        self.login_id, self.password, self.closed = login, password, False
+        self.code = Path(profile_dir).name
+        FakeSession.created.append(self)
+
+    def ensure_session(self):
+        if self.password == "refuse":
+            raise PortailLoginRefused("identifiant ou mot de passe refusé")
+
+    def close(self):
+        self.closed = True
+
+
+class WorkerEtSheet(unittest.TestCase):
+    def setUp(self):
+        self.saved = (worker_mod.PortailPro, config.PORTAIL_MAX_SESSIONS)
+        worker_mod.PortailPro, FakeSession.created = FakeSession, []
+        self.cabinet = config.Cabinet(code="Keobiz", libelle="Keobiz", portal_login="x", portal_password="y",
+                                      sender_address="contact@exemple.fr", reply_to="contact@exemple.fr", signature_html="")
+        self.state = {"accs": {}}
+        reg = accounts.AccountRegistry(None, load_env=lambda: dict(self.state["accs"]), disabled_env=set, refresh_s=0)
+        self.w = worker_mod.Worker(queue.Queue(), FakeSlack(), {"Keobiz": self.cabinet}, sf=None, mailer=FakeMailer(), registry=reg)
+
+    def tearDown(self):
+        worker_mod.PortailPro, config.PORTAIL_MAX_SESSIONS = self.saved
+
+    def test_mot_de_passe_corrige_dans_le_sheet_session_neuve_et_compte_reessaye(self):
+        self.state["accs"] = {"c.durand@keobiz.fr": acc("c.durand@keobiz.fr", "refuse")}
+        req = {"cdm_email": "c.durand@keobiz.fr", "cdm_nom": "Camille DURAND"}
+        _, label, code, open_session, key, source = self.w._accounts_for(req, self.cabinet)[1]
+        with self.assertRaises(PortailLoginRefused):
+            open_session()
+        self.w._disable(code, label, PortailLoginRefused("refusé"), key, source)
+        self.assertEqual(self.w._unusable(code, key), "identifiants refusés")
+        self.assertTrue(any("Google Sheet" in t for _, t in self.w.slack.posts) or not config.SLACK_ALERT_CHANNEL)
+        self.state["accs"] = {"c.durand@keobiz.fr": acc("c.durand@keobiz.fr", "corrige")}   # corrigé dans le Sheet
+        _, _, code, open_session, key2, _ = self.w._accounts_for(req, self.cabinet)[1]
+        self.assertIsNone(self.w._unusable(code, key2))                       # réessayé sans redémarrage
+        p = open_session()
+        self.assertEqual(p.password, "corrige")
+
+    def test_identifiants_changes_session_rouverte(self):
+        self.state["accs"] = {"c.durand@keobiz.fr": acc("c.durand@keobiz.fr", "v1")}
+        first = self.w.portail_for_collab(self.w.collabs["c.durand@keobiz.fr"])
+        self.assertIs(self.w.portail_for_collab(self.w.collabs["c.durand@keobiz.fr"]), first)   # réutilisée
+        self.state["accs"] = {"c.durand@keobiz.fr": acc("c.durand@keobiz.fr", "v2")}
+        second = self.w.portail_for_collab(self.w.collabs["c.durand@keobiz.fr"])
+        self.assertIsNot(second, first)
+        self.assertTrue(first.closed)
+        self.assertEqual(second.password, "v2")
+
+    def test_nombre_de_navigateurs_ouverts_limite(self):
+        config.PORTAIL_MAX_SESSIONS = 2
+        self.state["accs"] = {e: acc(e) for e in ("a@keobiz.fr", "b@keobiz.fr", "c@keobiz.fr")}
+        a = self.w.portail_for_collab(self.w.collabs["a@keobiz.fr"])
+        self.w.portail_for_collab(self.w.collabs["b@keobiz.fr"])
+        self.w.portail_for_collab(self.w.collabs["a@keobiz.fr"])               # a redevient le plus récent
+        self.w.portail_for_collab(self.w.collabs["c@keobiz.fr"])               # → b (le moins récent) est refermé
+        self.assertEqual(list(self.w.portails), ["collab-a", "collab-c"])
+        self.assertFalse(a.closed)
+        self.assertTrue(next(s for s in FakeSession.created if s.code == "collab-b").closed)
+
+    def test_rattachement_par_nom_dans_le_worker(self):
+        self.state["accs"] = {"c.durand@keobiz.fr": acc("c.durand@keobiz.fr", nom="Camille DURAND")}
+        codes = [a[2] for a in self.w._accounts_for({"cdm_email": "camille.durand@ancien.fr", "cdm_nom": "DURAND Camille"},
+                                                      self.cabinet)]
+        self.assertEqual(codes, ["Keobiz", "collab-c.durand"])
+
+
+    def test_comptes_inconnus_jamais_non_habilite(self):
+        def unreadable():
+            raise RuntimeError("HTTP 403")
+        reg = accounts.AccountRegistry(unreadable, load_env=dict, disabled_env=set)
+        w = worker_mod.Worker(queue.Queue(), FakeSlack(), {"Keobiz": self.cabinet}, sf=None, mailer=FakeMailer(), registry=reg)
+        w.portail_for = lambda cab: object()
+        saved = worker_mod.documents.fetch
+
+        def non(*a, **k):
+            raise NonHabiliteError("non habilité")
+        worker_mod.documents.fetch = non
+        try:
+            rid = db.create_request({"slack_user_id": "U1", "client_name": "X", "siren": "123456789", "entite": "Keobiz",
+                                     "cdm_nom": "Camille DURAND", "cdm_email": "c.durand@keobiz.fr",
+                                     "document_type": "CFE", "annee": "2025", "dry_run": 1})
+            w.process(rid)
+        finally:
+            worker_mod.documents.fetch = saved
+        r = db.get_request(rid)
+        self.assertEqual(r["status"], "FAILED")                                 # et non NOT_HABILITE
+        self.assertIn("Google Sheet des accès illisible", r["error_message"])
+
+
+class CampagneEtSheet(unittest.TestCase):
+    def test_compte_du_cdm_trouve_par_son_nom(self):
+        p = make_portals({}, collabs={"c.durand@keobiz.fr": acc("c.durand@keobiz.fr", nom="Camille DURAND")})
+        self.assertEqual(p.plan("123456789", "ancien.mail@keobiz.fr", "Camille Durand"), ["Keobiz", "collab-c.durand"])
+
+    def test_navigateurs_limites_pendant_l_inventaire(self):
+        import campaign
+        saved = (campaign.PortailPro, config.PORTAIL_MAX_SESSIONS)
+        campaign.PortailPro, config.PORTAIL_MAX_SESSIONS = FakeInventoryPortail, 2
+        try:
+            cab = config.Cabinet(code="Keobiz", libelle="Keobiz", portal_login="x", portal_password="y",
+                                 sender_address="contact@exemple.fr", reply_to="contact@exemple.fr", signature_html="")
+            p = campaign.InventoryPortals(cab, {e: acc(e) for e in ("a@keobiz.fr", "b@keobiz.fr")})
+            s_cab = p.session("Keobiz"); p.session("collab-a"); p.session("Keobiz"); p.session("collab-b")
+            self.assertEqual(list(p.sessions), ["Keobiz", "collab-b"])           # collab-a (le moins récent) refermé
+            self.assertIs(p.session("Keobiz"), s_cab)
+            p.session("collab-a")                                                 # le cabinet n'est JAMAIS refermé
+            self.assertIn("Keobiz", p.sessions)
+            p.close()
+        finally:
+            campaign.PortailPro, config.PORTAIL_MAX_SESSIONS = saved
+
+    def test_reouverture_en_echec_passager_erreur_sur_le_client_seulement(self):
+        import campaign
+        saved = (campaign.PortailPro, config.PORTAIL_MAX_SESSIONS, config.CAMPAIGN_INVENTORY_INTERVAL_S)
+        attempts = {"n": 0}
+
+        class Flaky(FakeInventoryPortail):
+            def ensure_session(self):
+                if self.login == "a@keobiz.fr":
+                    attempts["n"] += 1
+                    if attempts["n"] == 2:                                       # 2e ouverture (réouverture) en échec
+                        raise RuntimeError("Timeout 30000ms exceeded (page.goto)")
+        campaign.PortailPro, config.PORTAIL_MAX_SESSIONS, config.CAMPAIGN_INVENTORY_INTERVAL_S = Flaky, 2, 0
+        try:
+            cab = config.Cabinet(code="Keobiz", libelle="Keobiz", portal_login="x", portal_password="y",
+                                 sender_address="contact@exemple.fr", reply_to="contact@exemple.fr", signature_html="")
+            FakeInventoryPortail.LISTS = {"x": set(), "a@keobiz.fr": {"111111111"}, "b@keobiz.fr": set()}
+            p = campaign.InventoryPortals(cab, {e: acc(e) for e in ("a@keobiz.fr", "b@keobiz.fr")})
+            p.session("Keobiz"); p.session("collab-a"); p.session("collab-b")   # collab-a refermé (limite)
+            p.lists, p.complete = {"Keobiz": set(), "collab-a": {"111111111"}, "collab-b": set()}, \
+                {"Keobiz": True, "collab-a": True, "collab-b": True}
+            cm = CampaignManager(FakeSlack(), None, {}, queue.Queue())
+            item = {"client_email": "c@x.fr", "sf_account_id": "001REOPEN", "siren": "111111111", "cdm_email": "z@keobiz.fr",
+                    "cdm_nom": ""}
+            status, *_, compte = cm._inventory_one(p, {"document_type": "CFE", "annee": "2025"}, item)
+            self.assertEqual((status, compte), ("ERROR", "collab-a"))            # erreur sur CE client…
+            self.assertNotIn("collab-a", p.unusable)                             # …compte non écarté
+            status, *_ = cm._inventory_one(p, {"document_type": "CFE", "annee": "2025"}, item)
+            self.assertEqual(status, "FOUND")                                    # réouverture suivante réussie
+            p.close()
+        finally:
+            campaign.PortailPro, config.PORTAIL_MAX_SESSIONS, config.CAMPAIGN_INVENTORY_INTERVAL_S = saved
 
 
 # ---------------------------------------------------------------------------------------------- moteur Chrome partagé

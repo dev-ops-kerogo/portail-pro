@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -106,6 +106,13 @@ CAMPAIGN_RESUME_HOUR = int(env("CAMPAIGN_RESUME_HOUR", "7"))                    
 CAMPAIGN_CHANNEL = env("CAMPAIGN_CHANNEL") or SLACK_ALERT_CHANNEL                                # canal des messages de campagne et des rapports
 CAMPAIGNS_DIR = DATA_DIR / "campaigns"
 
+# Comptes portail des chargés de mission tenus dans un Google Sheet (voir accounts.py) — facultatif : vide = .env seul
+CREDENTIALS_SHEET_ID = env("CREDENTIALS_SHEET_ID")                                                 # identifiant du Sheet (dans son URL)
+CREDENTIALS_SHEET_TAB = env("CREDENTIALS_SHEET_TAB")                                               # onglet ; vide = le premier
+CREDENTIALS_SA_KEY_PATH = env("CREDENTIALS_SA_KEY_PATH") or GOOGLE_SA_KEY_PATH                     # clé du compte technique Google (lecture seule)
+CREDENTIALS_REFRESH_S = int(env("CREDENTIALS_REFRESH_S", "900"))                                   # relecture du Sheet (secondes)
+PORTAIL_MAX_SESSIONS = int(env("PORTAIL_MAX_SESSIONS", "6"))                                       # navigateurs portail ouverts en même temps (par thread)
+
 DRY_RUN = env_bool("DRY_RUN", False)   # global : aucun email, PDF + aperçu déposés dans Slack
 DRY_RUN_CHANNEL = env("DRY_RUN_CHANNEL") or SLACK_ALERT_CHANNEL   # canal où déposer PDF + aperçu en mode test ; vide = message direct au demandeur
 
@@ -157,7 +164,19 @@ class PortalAccount:
     nom: str         # libellé affiché ; vide = nom du chargé de mission dans Salesforce
     email: str       # email du chargé de mission dans Salesforce (clé de routage, en minuscules)
     login: str
-    password: str
+    password: str = field(repr=False)   # jamais affiché, même si la fiche est journalisée par erreur
+    source: str = ".env"                # « .env » ou « Google Sheet » (texte des alertes)
+
+
+def disabled_collab_emails() -> set[str]:
+    """Emails Salesforce ET identifiants (minuscules) des comptes désactivés dans .env (PORTAIL_COLLAB<n>_ACTIF=false) :
+    ils le restent même s'ils figurent dans le Google Sheet des accès (désactivation locale explicite)."""
+    out = set()
+    for k in os.environ:
+        if (m := re.fullmatch(r"PORTAIL_COLLAB(\d+)_LOGIN", k)) and not env_bool(f"PORTAIL_COLLAB{m.group(1)}_ACTIF", True):
+            p = f"PORTAIL_COLLAB{m.group(1)}_"
+            out |= {v for v in ((env(p + "LOGIN") or "").strip().lower(), (env(p + "EMAIL_SF") or "").strip().lower()) if v}
+    return out
 
 
 def load_collab_accounts() -> dict[str, PortalAccount]:

@@ -279,7 +279,9 @@ def main() -> int:
     ap.add_argument("--test-sf", metavar="TERME", help="teste la recherche client Salesforce et s'arrête")
     ap.add_argument("--test-portail", nargs=2, metavar=("ENTITE", "SIREN"), help="teste la connexion portailpro d'un cabinet et liste les avis d'un SIREN")
     ap.add_argument("--test-compte", nargs=2, metavar=("EMAIL_CDM", "SIREN"),
-                    help="teste le compte portail d'un chargé de mission (déclaré dans .env) et liste les avis d'un SIREN")
+                    help="teste le compte portail d'un chargé de mission (Google Sheet ou .env) et liste les avis d'un SIREN")
+    ap.add_argument("--test-sheet", action="store_true",
+                    help="lit le Google Sheet des accès et affiche des COMPTAGES (aucun identifiant ni mot de passe)")
     ap.add_argument("--test-mysql", action="store_true", help="teste le journal MySQL : crée la table si besoin et rejoue les demandes récentes")
     args = ap.parse_args()
 
@@ -304,12 +306,29 @@ def main() -> int:
             p.close()
         return 0
 
+    if args.test_sheet:
+        import accounts
+        if not config.CREDENTIALS_SHEET_ID:
+            print("CREDENTIALS_SHEET_ID non renseigné dans .env"); return 1
+        rows = accounts.fetch_sheet(config.CREDENTIALS_SHEET_ID, config.CREDENTIALS_SHEET_TAB, config.CREDENTIALS_SA_KEY_PATH)
+        known = {n for names in accounts.COLUMNS.values() for n in names}   # jamais le contenu brut d'une ligne
+        print("colonnes reconnues :", [(chr(65 + i), h) for i, h in enumerate(rows[0] if rows else [])
+                                       if accounts._norm(h) in known] if rows else "(Sheet vide)")
+        sheet, notes = accounts.parse_rows(rows)
+        disabled = config.disabled_collab_emails()
+        print(f"comptes utilisables : {len(sheet)} (dont {len(set(sheet) & disabled)} désactivé(s) dans .env, donc ignoré(s))")
+        kinds = {"doublon(s)": " présent ", "mot(s) de passe manquant(s)": "mot de passe manquant",
+                 "mail(s) absent(s) ou invalide(s)": "mail de connexion absent"}
+        print("remarques :", ", ".join(f"{sum(k in n for n in notes)} {label}" for label, k in kinds.items()))
+        return 0
+
     if args.test_compte:
         from portailpro import PortailPro
+        import accounts
         email, siren = args.test_compte
-        acc = config.load_collab_accounts().get(email.strip().lower())
+        acc = accounts.get_registry().current().get(email.strip().lower())
         if not acc:
-            print(f"Aucun compte actif déclaré dans .env pour {email} (PORTAIL_COLLAB<n>_LOGIN / _PASSWORD / _EMAIL_SF)"); return 1
+            print(f"Aucun compte actif pour {email} (Google Sheet des accès ou .env)"); return 1
         p = PortailPro(config.PROFILES_DIR / acc.code, headless=config.PORTAIL_HEADLESS, channel=config.BROWSER_CHANNEL,
                        login=acc.login, password=acc.password)
         try:
@@ -341,9 +360,21 @@ def main() -> int:
 
     from campaign import CampaignManager
 
+    import accounts
     app = App(token=config.SLACK_BOT_TOKEN)
+
+    def alert(text: str) -> None:
+        if config.SLACK_ALERT_CHANNEL:
+            try:
+                app.client.chat_postMessage(channel=config.SLACK_ALERT_CHANNEL, text=text)
+            except Exception as e:
+                log.warning("Alerte Slack impossible : %s", e)
+
+    registry = accounts.get_registry(on_notice=alert)   # Google Sheet des accès (si configuré) + .env
+    log.info("Comptes portail : %s", registry.summary())
     work_queue: queue.Queue = queue.Queue()
-    campaigns = CampaignManager(app.client, sf, cabinets, work_queue)
+    campaigns = CampaignManager(app.client, sf, cabinets, work_queue, collabs_provider=lambda: registry.current(force=True),
+                                accounts_unknown=lambda: registry.unknown)
     register_handlers(app, sf, cabinets, work_queue, campaigns)
 
     try:  # réchauffer la session Salesforce (le login SOAP prend 1-2 s, à éviter pendant une soumission)
@@ -351,7 +382,7 @@ def main() -> int:
     except Exception as e:
         log.warning("Salesforce indisponible au démarrage : %s", e)
 
-    Worker(work_queue, app.client, cabinets, sf, mailer).start()
+    Worker(work_queue, app.client, cabinets, sf, mailer, registry=registry).start()
     for rid in db.pending_request_ids():   # reprise des demandes interrompues par un redémarrage
         work_queue.put(rid)
     campaigns.resume_interrupted()
