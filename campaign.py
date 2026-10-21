@@ -540,6 +540,12 @@ class CampaignManager:
                     time.sleep(min(600, max(30, (resume - datetime.now()).total_seconds())))
                     if (db.get_campaign(campaign_id) or {}).get("status") == "CANCELLED":
                         break
+                # comptes des chargés de mission inconnus (Sheet jamais lu depuis le démarrage) : pause plutôt que des
+                # demandes vouées à l'échec « vérification impossible »
+                while self.accounts_unknown() and (db.get_campaign(campaign_id) or {}).get("status") != "CANCELLED":
+                    self._update(c["slack_channel"], ts, f":rocket: {title}\nEn pause : Google Sheet des accès illisible, "
+                                                          f"comptes des chargés de mission inconnus. {self._progress(campaign_id, total)}")
+                    time.sleep(60)
                 # connexion du cabinet suspendue (échecs répétés) : pause plutôt que des demandes vouées à l'échec
                 while (until := login_blocked_until(cabinet.portal_login, cabinet.portal_password)) \
                         and (db.get_campaign(campaign_id) or {}).get("status") != "CANCELLED":

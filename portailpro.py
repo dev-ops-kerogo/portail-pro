@@ -88,14 +88,17 @@ NON_HABILITE_CODES = {"131105"}
 BENIGN_HABILITATION_ERRORS = {"50003"}
 # Échecs de connexion consécutifs tolérés pour un même identifiant ; au-delà, une seule tentative par LOGIN_COOLDOWN_S.
 MAX_FAILED_LOGINS, LOGIN_COOLDOWN_S = 2, 3600
-LOGIN_REFUSED = re.compile(r"mot de passe est incorrect|courriel et/ou votre mot de passe", re.I)
+# Messages du portail signifiant que les identifiants ne doivent PLUS être soumis (refus, compte bloqué…).
+LOGIN_REFUSED = re.compile(r"mot de passe est incorrect|courriel et/ou votre mot de passe|identifiants? (ou mot de passe )?"
+                           r"(est |sont )?(incorrects?|invalides?|erron)|mot de passe (incorrect|invalide|erron)|"
+                           r"compte (est |a été )?(bloqu|verrouill|suspendu)|trop de tentatives", re.I)
 MAINTENANCE = re.compile(r"maintenance|indisponible", re.I)
 
 
 # Identifiants refusés, tous threads confondus (worker, campagnes) : jamais resoumis — y compris lors d'un renouvellement
 # de jeton, ni après un redémarrage (conservés dans data/, sous forme d'empreinte HMAC : jamais le mot de passe). Un mot de
 # passe CORRIGÉ (Google Sheet ou .env) a une autre empreinte : il est essayé. Pour réessayer un mot de passe inchangé,
-# supprimer data/portail-identifiants-refuses.json.
+# supprimer data/portail-identifiants-refuses.json puis redémarrer le service.
 _REFUSED: set[tuple[str, str]] = set()
 _REFUSED_LOADED = False
 _KEY_LOCK = threading.Lock()
@@ -157,6 +160,10 @@ def _load_refused() -> None:
         try:
             st = path.stat()
         except FileNotFoundError:
+            if _REFUSED_STAMP is not None:   # fichier supprimé à la main : remise à zéro voulue des refus
+                log.warning("Fichier des identifiants refusés supprimé : les refus mémorisés sont oubliés")
+                _REFUSED.clear()
+                _REFUSED_STAMP = None
             _REFUSED_LOADED = True
             return
         stamp = (st.st_mtime_ns, st.st_size)
@@ -171,6 +178,7 @@ def _load_refused() -> None:
                 path.rename(aside)
             except OSError:
                 pass
+            _REFUSED_STAMP = None   # mis de côté ≠ supprimé à la main : les refus en mémoire sont gardés (et réécrits)
             log.error("Fichier des identifiants refusés illisible (%s) : mis de côté (%s). Les refus déjà en mémoire "
                       "restent appliqués ; vérifier les comptes concernés.", type(e).__name__, aside.name)
 
@@ -427,6 +435,7 @@ class PortailPro:
     def _fill_login_form(self) -> None:
         page = self.page
         self._dismiss_cookie_banner()
+        submitted = False
         for attempt in (1, 2, 3):
             self._wait_form_ready()
             ident = self._find_ident()
@@ -441,14 +450,16 @@ class PortailPro:
                     self._accept_cookie_banner_and_reload()
                 continue
             btn = page.get_by_role("button", name=re.compile("connexion|se connecter|valider", re.I)).first
+            self._pre_submit_refusals = self._refusal_messages()   # textes déjà présents avant l'envoi
+            submitted = True   # à partir d'ici le mot de passe peut être parti : un seul envoi par connexion
             if btn.count():
-                try:
-                    btn.click(timeout=10000)
+                try:   # no_wait_after : une erreur ne peut venir que d'AVANT le clic (bouton masqué, voile…)
+                    btn.click(timeout=10000, no_wait_after=True)
                 except Exception:
                     self._dismiss_cookie_banner()
-                    btn.click(force=True)
+                    btn.click(force=True, no_wait_after=True)
             else:
-                pwd.press("Enter")
+                pwd.press("Enter", no_wait_after=True)
             # Connexion réussie dès qu'un jeton API est capturé ou que le formulaire a disparu (hors page de login).
             deadline = time.time() + 60   # un seul envoi par connexion : on lui laisse le temps d'aboutir
             while time.time() < deadline:
@@ -470,14 +481,24 @@ class PortailPro:
             page.screenshot(path=str(shot), full_page=True)
         except Exception:
             shot = None
-        raise PortailProError("Connexion refusée (identifiants ?) ou étape supplémentaire (MFA) : intervention manuelle nécessaire"
+        if submitted:
+            # Envoyé, sans jeton ni changement de page : refus présumé (message non reconnu). Mémorisé comme un refus
+            # pour ne jamais renvoyer ce mot de passe (ni dans une heure, ni après un redémarrage).
+            mark_refused(self.login_id, self.password)
+            raise PortailLoginRefused("refus présumé : formulaire toujours affiché après l'envoi des identifiants"
+                                      + (f" — capture : {shot}" if shot else "") + " — mot de passe mis de côté")
+        raise PortailProError("Saisie impossible dans le formulaire de connexion (aucun envoi) : intervention manuelle nécessaire"
                               + (f" — capture : {shot}" if shot else ""))
 
-    def _login_refused(self) -> bool:
+    def _refusal_messages(self) -> set[str]:
         try:
-            return bool(LOGIN_REFUSED.search(self.page.inner_text("body", timeout=2000)))
+            return {m.group(0).lower() for m in LOGIN_REFUSED.finditer(self.page.inner_text("body", timeout=2000))}
         except Exception:
-            return False
+            return set()
+
+    def _login_refused(self) -> bool:
+        """Message de refus APPARU après l'envoi (un lien d'aide « compte bloqué ? » déjà présent ne compte pas)."""
+        return bool(self._refusal_messages() - getattr(self, "_pre_submit_refusals", set()))
 
     def ensure_session(self) -> None:
         """À appeler avant chaque lot d'appels : (re)connecte si nécessaire."""

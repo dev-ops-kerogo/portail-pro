@@ -245,6 +245,104 @@ class IdentifiantsRefuses(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertTrue(list(path.parent.glob(path.name + ".illisible-*")))
 
+    def formulaire(self, login, body, after_click=None):
+        """PortailPro sur un faux formulaire de connexion ; horloge accélérée (attentes de 60 s instantanées)."""
+        import portailpro
+
+        class El:
+            value = ""
+
+            def fill(self, v):
+                self.value = v
+
+            def input_value(self):
+                return self.value
+
+            def count(self):
+                return 1
+
+        class Page:
+            url, clicks = "https://portailpro.gouv.fr/ms/login", 0
+
+            def __init__(self):
+                self.body, self.pwd, self.btn = body, El(), El()
+                page = self
+
+                def click(**kw):
+                    page.clicks += 1
+                    if after_click:
+                        page.body = after_click
+                self.btn.click = click
+
+            def locator(self, sel):
+                return type("L", (), {"first": self.pwd})()
+
+            def get_by_role(self, *a, **k):
+                return type("R", (), {"first": self.btn})()
+
+            def wait_for_timeout(self, ms):
+                pass
+
+            def inner_text(self, sel, timeout=None):
+                return self.body
+
+            def screenshot(self, **k):
+                raise RuntimeError("pas de capture en test")
+
+        class FastTime:
+            t = 1000.0
+
+            def time(self):
+                FastTime.t += 7
+                return FastTime.t
+
+            def __getattr__(self, name):
+                return getattr(time, name)
+        p = object.__new__(PortailPro)
+        p.login_id, p.password, p.token, p.page = login, "mdp-faux", None, Page()
+        ident = El()
+        p._dismiss_cookie_banner = p._wait_form_ready = lambda: None
+        p._find_ident = lambda: ident
+        p._login_form_visible = lambda timeout_ms: True
+        saved = portailpro.time
+        portailpro.time = FastTime()
+        return p, (lambda: setattr(portailpro, "time", saved))
+
+    def test_refus_presume_un_seul_envoi_et_memorise(self):
+        import portailpro
+        p, restore = self.formulaire("presume@keobiz.fr", "Connexion — Mon compte est bloqué ?")   # lien d'aide déjà là
+        try:
+            with self.assertRaises(PortailLoginRefused) as ctx:
+                p._fill_login_form()
+        finally:
+            restore()
+        self.assertEqual(p.page.clicks, 1)                                       # un seul envoi
+        self.assertIn("refus présumé", str(ctx.exception))
+        self.assertTrue(portailpro.is_refused("presume@keobiz.fr", "mdp-faux"))  # jamais renvoyé
+
+    def test_message_de_refus_apparu_apres_l_envoi(self):
+        import portailpro
+        p, restore = self.formulaire("message@keobiz.fr", "Connexion", after_click="Identifiants incorrects")
+        try:
+            with self.assertRaises(PortailLoginRefused) as ctx:
+                p._fill_login_form()
+        finally:
+            restore()
+        self.assertNotIn("présumé", str(ctx.exception))
+        self.assertEqual(p.page.clicks, 1)
+        self.assertTrue(portailpro.is_refused("message@keobiz.fr", "mdp-faux"))
+
+    def test_supprimer_le_fichier_des_refus_les_oublie(self):
+        import portailpro
+        portailpro.mark_refused("efface@keobiz.fr", "pw")
+        self.assertTrue(portailpro.is_refused("efface@keobiz.fr", "pw"))
+        saved = set(_REFUSED)
+        portailpro._refused_file().unlink()
+        try:
+            self.assertFalse(portailpro.is_refused("efface@keobiz.fr", "pw"))
+        finally:
+            _REFUSED.update(k for k in saved if k[0] != "efface@keobiz.fr")
+
     def test_connexion_reussie_remet_le_compteur_a_zero(self):
         key = _credentials_key("ok@keobiz.fr", "bon")
         _FAILED[key] = (1, time.time())

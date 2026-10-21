@@ -135,7 +135,7 @@ def no_document_requests() -> list[dict]:
 
 
 # ------------------------------------------------------------------ portail
-LOGIN_REFUSED = re.compile(r"mot de passe est incorrect|courriel et/ou votre mot de passe|identifiants? incorrect", re.I)
+LOGIN_REFUSED = portailpro.LOGIN_REFUSED   # même reconnaissance des refus que le service
 
 
 def single_attempt_login(p: PortailPro) -> str:
@@ -155,13 +155,17 @@ def single_attempt_login(p: PortailPro) -> str:
     else:
         raise PortailProError("Le formulaire refuse la saisie (bandeau cookies ?) — aucune tentative envoyée")
     btn = page.get_by_role("button", name=re.compile("connexion|se connecter|valider", re.I)).first
+    try:   # messages déjà présents avant l'envoi (lien d'aide « compte bloqué ? »…) : ne comptent pas comme refus
+        before = {m.group(0).lower() for m in LOGIN_REFUSED.finditer(page.inner_text("body", timeout=2000))}
+    except Exception:
+        before = set()
     if btn.count():
         try:
-            btn.click(timeout=10000)
+            btn.click(timeout=10000, no_wait_after=True)   # erreur possible seulement AVANT le clic : pas de double envoi
         except Exception:
-            p._dismiss_cookie_banner(); btn.click(force=True)
+            p._dismiss_cookie_banner(); btn.click(force=True, no_wait_after=True)
     else:
-        pwd.press("Enter")
+        pwd.press("Enter", no_wait_after=True)
     deadline = time.time() + 30
     while time.time() < deadline:
         if p.token is not None:
@@ -170,7 +174,7 @@ def single_attempt_login(p: PortailPro) -> str:
             body = page.inner_text("body", timeout=2000)
         except Exception:
             body = ""
-        if LOGIN_REFUSED.search(body):
+        if {m.group(0).lower() for m in LOGIN_REFUSED.finditer(body)} - before:
             portailpro.mark_refused(p.login_id, p.password)   # partagé avec le service : jamais resoumis
             raise PortailProError("Identifiant ou mot de passe REFUSÉ par le portail "
                                   "(1 seule tentative envoyée, aucun nouvel essai)")

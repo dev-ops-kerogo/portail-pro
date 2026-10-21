@@ -146,7 +146,7 @@ class Worker(threading.Thread):
                             f"(sous {max(1, config.CREDENTIALS_REFRESH_S // 60)} min)." if sheet
                             else "Corriger son mot de passe dans .env (ou cabinets.json), puis redémarrer le service.")
                            + " Le même mot de passe ne sera plus jamais soumis (pour le réessayer tel quel : supprimer "
-                             "data/portail-identifiants-refuses.json)." if refused
+                             "data/portail-identifiants-refuses.json puis redémarrer le service)." if refused
                            else "Vérifier s'il faut se connecter une fois à la main (code de vérification)."))
         return reason
 

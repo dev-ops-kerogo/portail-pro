@@ -81,7 +81,7 @@ cp cabinets.example.json cabinets.json
   Sheet n'a jamais pu être lu, aucun client n'est déclaré « non habilité » (inventaires reportés).
   Un mot de passe refusé par le portail n'est **plus jamais resoumis**, même après redémarrage (empreinte dans
   `data/portail-identifiants-refuses.json`, jamais le mot de passe) : le corriger suffit ; pour réessayer un mot de passe
-  inchangé, supprimer ce fichier.
+  inchangé, supprimer ce fichier puis redémarrer le service.
 
 ## 4. Vérifier brique par brique
 

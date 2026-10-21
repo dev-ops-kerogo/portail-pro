@@ -162,7 +162,9 @@ class AccountRegistry:
 
     def current(self, force: bool = False) -> dict[str, PortalAccount]:
         with self._lock:
-            if force or self._accounts is None or time.time() - self._loaded_at >= self.refresh_s:
+            # Sheet jamais lu : nouvel essai chaque minute (comptes inconnus), sinon toutes les refresh_s
+            every = min(60, self.refresh_s) if self.fetch_rows is not None and self._sheet is None else self.refresh_s
+            if force or self._accounts is None or time.time() - self._loaded_at >= every:
                 self._reload()
             return dict(self._accounts or {})
 
