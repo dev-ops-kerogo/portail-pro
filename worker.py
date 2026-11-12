@@ -1,6 +1,6 @@
 """Worker : traite les demandes une par une, dans un thread dédié (Playwright impose un seul thread).
 
-Pour chaque demande : session portailpro → PDF → email Gmail → archivage Salesforce → notification Slack.
+Pour chaque demande : session portailpro → PDF → email Gmail → archivage Salesforce → dépôt GED Pennylane → notification Slack.
 Comptes portail essayés dans l'ordre : celui du cabinet, puis le compte personnel du chargé de mission du client
 s'il est déclaré (Google Sheet des accès ou .env — voir accounts.py). Un compte « non habilité » pour le client passe la
 main au suivant ; si aucun n'est habilité, la demande passe en NOT_HABILITE (ce n'est pas « aucun document »).
@@ -19,6 +19,7 @@ import config
 import db
 import documents
 from config import Cabinet, PortalAccount
+from ged_pennylane import GEDPennylane, ged_active, GEDError
 from mailer import Mailer
 from portailpro import (NonHabiliteError, PortailLoginAbandoned, PortailLoginRefused, PortailPro, PortailProError,
                         _credentials_key)
@@ -250,6 +251,7 @@ class Worker(threading.Thread):
         db.add_event(request_id, "SENT", f"gmail={sent.gmail_id} fichiers={len(files)}")
 
         archived = self._archive(req, files, sent, sent_at)
+        ged_ok = self._deposer_ged(req, files)
 
         lines = [f":white_check_mark: *{req['client_name']}* — {documents.DOCUMENT_TYPES[req['document_type']]['label']} {req['annee']} "
                  f"envoyé à {req['client_email']}" + (f" (redirigé vers {config.TEST_RECIPIENT})" if config.TEST_RECIPIENT else ""),
@@ -261,6 +263,9 @@ class Worker(threading.Thread):
         if archived is not None:
             lines.append("• PDF et email enregistrés sur la fiche Salesforce" + (" (compte de test)" if config.ARCHIVE_TEST_ACCOUNT_ID else "")
                          if archived else "• :warning: Archivage Salesforce en échec (email bien envoyé)")
+        if ged_ok is not None:
+            lines.append("• Avis déposé dans la GED Pennylane" if ged_ok
+                         else "• :warning: Dépôt GED Pennylane en échec (email et archivage OK)")
         self._notify(req, "\n".join(lines))
 
     def _deliver_dry_run(self, req: dict, cabinet: Cabinet, files: list[Path], skipped: list, via: str | None = None) -> None:
@@ -302,6 +307,36 @@ class Worker(threading.Thread):
             log.warning("Archivage Salesforce %s : %s", req["request_id"], e)
             db.add_event(req["request_id"], "ARCHIVE_FAILED", str(e))
             return False
+
+    def _deposer_ged(self, req: dict, files: list[Path]) -> bool | None:
+        """Dépose les avis CFE dans la GED Pennylane du client. N'échoue jamais la demande :
+        une erreur est journalisée et alertée, mais l'email au client est déjà parti.
+        None = dépôt GED désactivé ou type de document non concerné."""
+        if not ged_active() or req["document_type"] != "CFE":
+            return None
+        try:
+            ged = GEDPennylane()
+        except GEDError as e:
+            log.warning("GED Pennylane indisponible : %s", e)
+            return None
+        ok = True
+        try:
+            for p in files:
+                try:
+                    ged.deposer(req["siren"], req["annee"], p.name, p.read_bytes())
+                    db.add_event(req["request_id"], "GED_DEPOSEE", p.name)
+                except GEDError as e:
+                    ok = False
+                    db.add_event(req["request_id"], "GED_ECHEC", f"{p.name} : {e}")
+                    self._alert(f":open_file_folder: Dépôt GED Pennylane en échec pour *{req['client_name']}* "
+                                f"(SIREN {req['siren']}) : {e}. L'avis a bien été envoyé au client et archivé Salesforce.")
+        except Exception as e:   # erreur inattendue : on ne fait jamais échouer la demande pour ça
+            ok = False
+            log.warning("Dépôt GED %s : %s", req["request_id"], e)
+            db.add_event(req["request_id"], "GED_ECHEC", str(e))
+        finally:
+            ged.close()
+        return ok
 
     # ------------------------------------------------------------ issues
     def _not_habilite(self, req: dict, labels: list[str], collabs: dict[str, PortalAccount] | None = None) -> None:
