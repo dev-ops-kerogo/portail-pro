@@ -605,6 +605,10 @@ class CampaignManager:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
         from openpyxl.utils import get_column_letter
+        # cas de paiement lu dans l'avis → libellé lisible pour le rapport
+        CAS_LABELS = {"RIEN_A_PAYER": "Rien à payer", "A_PAYER": "À payer (sans prélèvement)",
+                      "PRELEVEMENT_ECHEANCE": "Prélèvement à l'échéance", "MENSUALISE": "Mensualisé",
+                      "INDETERMINE": "À vérifier"}
         c = db.get_campaign(campaign_id)
         items = db.list_campaign_items(campaign_id)
         reqs = db.campaign_requests(campaign_id) if final else {}
@@ -613,7 +617,7 @@ class CampaignManager:
         ws.title = "Rapport final" if final else "Inventaire"
         headers = ["Client", "SIREN", "Cabinet", "Email client", "Chargé de mission", "Résultat inventaire", "Nb avis", "Montant total €", "Détail"]
         if final:
-            headers += ["Statut envoi", "Envoyé le", "Envoyé à", "Fichiers", "Erreur"]
+            headers += ["Cas de paiement", "Action CDM", "Statut envoi", "Envoyé le", "Envoyé à", "Fichiers", "Erreur"]
         ws.append(headers)
         for cell in ws[1]:
             cell.font = Font(bold=True, color="FFFFFF"); cell.fill = PatternFill("solid", fgColor="1F3A68")
@@ -625,10 +629,12 @@ class CampaignManager:
                 if r:
                     docs = db.list_documents(r["request_id"])
                     files = ", ".join(Path(d["file_path"]).name for d in docs if d["status"] == "DOWNLOADED" and d["file_path"])
-                    row += [REQ_LABELS.get(r["status"], r["status"]), (r["sent_at"] or "")[:16].replace("T", " "),
+                    cas = CAS_LABELS.get(r["cas_paiement"], r["cas_paiement"] or "")
+                    action = "Oui" if r["action_cdm"] else ("Non" if r["cas_paiement"] else "")
+                    row += [cas, action, REQ_LABELS.get(r["status"], r["status"]), (r["sent_at"] or "")[:16].replace("T", " "),
                             (config.TEST_RECIPIENT or r["client_email"]) if r["status"] == "SENT" else "", files, r["error_message"]]
                 else:
-                    row += ["Non envoyé" if it["status"] == "FOUND" else "", "", "", "", ""]
+                    row += ["", "", "Non envoyé" if it["status"] == "FOUND" else "", "", "", "", ""]
             ws.append(row)
         for i, h in enumerate(headers, 1):
             ws.column_dimensions[get_column_letter(i)].width = min(60, max(12, max((len(str(ws.cell(row=r, column=i).value or "")) for r in range(1, ws.max_row + 1)), default=10) + 2))
