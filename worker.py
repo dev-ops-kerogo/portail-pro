@@ -250,6 +250,11 @@ class Worker(threading.Thread):
         db.update_request(request_id, status="SENT", gmail_message_id=sent.gmail_id, sent_at=sent_at)
         db.add_event(request_id, "SENT", f"gmail={sent.gmail_id} fichiers={len(files)}")
 
+        # cas de paiement lu dans l'avis (premier avis analysé) : alimente le tableau récap
+        cfe = next((r for r in results if getattr(r, "cas", None)), None)
+        if cfe:
+            db.update_request(request_id, cas_paiement=cfe.cas, action_cdm=1 if cfe.action_cdm else 0)
+
         archived = self._archive(req, files, sent, sent_at)
         ged_ok = self._deposer_ged(req, files)
 
