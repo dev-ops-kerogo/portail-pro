@@ -26,6 +26,9 @@ class DocResult:
     cas: str | None = None                 # RIEN_A_PAYER | A_PAYER | PRELEVEMENT_ECHEANCE | MENSUALISE | INDETERMINE
     montant_a_payer: float | None = None
     action_cdm: bool | None = None
+    date_limite: str | None = None         # cas A_PAYER : date limite de paiement
+    date_prelevement: str | None = None    # cas PRELEVEMENT_ECHEANCE : date du prélèvement
+    solde_restant: float | None = None     # cas MENSUALISE : somme restant à prélever
 
 
 def fetch(portail: PortailPro, document_type: str, siren: str, annee: str, periode: str | None = None) -> list[DocResult]:
@@ -49,7 +52,10 @@ def fetch_cfe(portail: PortailPro, siren: str, annee: str) -> list[DocResult]:
                                  content=contenu, status="DOWNLOADED",
                                  cas=analyse.cas if analyse else None,
                                  montant_a_payer=analyse.montant_a_payer if analyse else None,
-                                 action_cdm=analyse.action_cdm if analyse else None))
+                                 action_cdm=analyse.action_cdm if analyse else None,
+                                 date_limite=analyse.date_limite if analyse else None,
+                                 date_prelevement=analyse.date_prelevement if analyse else None,
+                                 solde_restant=analyse.solde_restant if analyse else None))
         if a.id_suite:
             results.append(DocResult(label=label + " (suite)", filename=f"CFE_{annee}_{a.siret}_suite.pdf",
                                      content=portail.download_document(siren, a.id_suite), status="DOWNLOADED"))
