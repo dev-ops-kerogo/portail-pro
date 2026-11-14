@@ -238,10 +238,12 @@ class Worker(threading.Thread):
                                      f"{req['annee']} : aucun document trouvé sur le portail{where}. *Aucun email envoyé.*")
 
         if config.DRY_RUN or req.get("dry_run"):
-            return self._deliver_dry_run(req, cabinet, files, skipped, via)
+            cfe = next((r for r in results if getattr(r, "cas", None)), None)
+            return self._deliver_dry_run(req, cabinet, files, skipped, via, analyse=cfe)
 
+        cfe = next((r for r in results if getattr(r, "cas", None)), None)   # analyse de l'avis (gabarit + champs du mail)
         try:
-            sent = self.mailer.send(req, cabinet, files)
+            sent = self.mailer.send(req, cabinet, files, analyse=cfe)
         except Exception as e:
             log.exception("Envoi email %s", request_id)
             self._alert(f":rotating_light: Échec envoi Gmail sur `{request_id}` ({req['client_name']}) : `{e}`")
@@ -250,8 +252,7 @@ class Worker(threading.Thread):
         db.update_request(request_id, status="SENT", gmail_message_id=sent.gmail_id, sent_at=sent_at)
         db.add_event(request_id, "SENT", f"gmail={sent.gmail_id} fichiers={len(files)}")
 
-        # cas de paiement lu dans l'avis (premier avis analysé) : alimente le tableau récap
-        cfe = next((r for r in results if getattr(r, "cas", None)), None)
+        # données lues dans l'avis : tableau récap (cfe déjà calculé avant l'envoi)
         if cfe:
             db.update_request(request_id, cas_paiement=cfe.cas, action_cdm=1 if cfe.action_cdm else 0)
 
@@ -273,14 +274,14 @@ class Worker(threading.Thread):
                          else "• :warning: Dépôt GED Pennylane en échec (email et archivage OK)")
         self._notify(req, "\n".join(lines))
 
-    def _deliver_dry_run(self, req: dict, cabinet: Cabinet, files: list[Path], skipped: list, via: str | None = None) -> None:
+    def _deliver_dry_run(self, req: dict, cabinet: Cabinet, files: list[Path], skipped: list, via: str | None = None, analyse=None) -> None:
         """Mode test : rien ne part chez le client ; PDF + aperçu vont dans DRY_RUN_CHANNEL (sinon en message direct au demandeur)."""
         request_id = req["request_id"]
         db.update_request(request_id, status="DRY_RUN")
         db.add_event(request_id, "DRY_RUN", f"fichiers={len(files)}")
         if req.get("campaign_id"):   # campagne en mode test : on ne dépose pas des centaines de PDF dans Slack
             return
-        preview = self.mailer.preview(req, cabinet)
+        preview = self.mailer.preview(req, cabinet, analyse)
         text = (f":test_tube: *Mode test* — demande de <@{req['slack_user_id']}> — *{req['client_name']}* (SIREN {req['siren']}) : "
                 f"{len(files)} PDF récupéré(s), *aucun email envoyé, aucun archivage*.\n"
                 + (f"• Récupéré via le compte portail de {via}\n" if via else "")
