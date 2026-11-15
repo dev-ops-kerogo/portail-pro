@@ -377,7 +377,7 @@ class CampaignManager:
             report = self.build_report(campaign_id, final=False)
             found = counts.get("FOUND", 0)
             to_send = min(found, c["send_limit"]) if c.get("send_limit") else found
-            text = (f":clipboard: {title}\nInventaire terminé : {total} clients — {self._summary(counts)}.\n"
+            text = (f":clipboard: {title}\nInventaire terminé : {total} clients — {self._summary(counts)}." + self._lien_suivi() + "\n"
                     f"*{to_send} email(s)* partiraient si vous lancez l'envoi"
                     + (f" (limite de test : {c['send_limit']})" if c.get("send_limit") else "")
                     + (f" — *tous redirigés vers {config.TEST_RECIPIENT}*" if config.TEST_RECIPIENT else " — *aux clients*")
@@ -584,7 +584,7 @@ class CampaignManager:
             counts = db.campaign_request_counts(campaign_id)
             self._update(c["slack_channel"], ts, f"{':no_entry_sign:' if cancelled else ':checkered_flag:'} {title}\n"
                                                   f"Envoi {'annulé' if cancelled else 'terminé'} : "
-                                                  + ", ".join(f"{n} {REQ_LABELS.get(s, s).lower()}" for s, n in sorted(counts.items())) + ".")
+                                                  + ", ".join(f"{n} {REQ_LABELS.get(s, s).lower()}" for s, n in sorted(counts.items())) + "." + self._lien_suivi())
             self._upload(c["slack_channel"], report, f"Rapport final campagne {campaign_id}")
         except Exception as e:
             log.exception("Envoi campagne %s", campaign_id)
@@ -659,6 +659,13 @@ class CampaignManager:
         return path
 
     # ------------------------------------------------------------ Slack
+    @staticmethod
+    def _lien_suivi() -> str:
+        """Ligne 'suivi en direct' pour les messages de campagne, si un Google Sheet est configuré.
+        Le Sheet se remplit au fil de l'eau ; le rapport Excel joint reste le filet de secours."""
+        url = getattr(config, 'SUIVI_SHEET_URL', '') or ''
+        return f"\n:bar_chart: Suivi en direct (Google Sheet) : {url}\n_L'Excel joint sert de sauvegarde._" if url else ""
+
     @staticmethod
     def _summary(counts: dict) -> str:
         return ", ".join(f"{n} {ITEM_LABELS.get(k, k).lower()}" for k, n in sorted(counts.items(), key=lambda x: -x[1]) if k != "PENDING") or "rien encore"
