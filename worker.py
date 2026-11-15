@@ -19,6 +19,7 @@ import config
 import db
 import documents
 import fenetre_envoi
+import suivi_sheet
 from config import Cabinet, PortalAccount
 from ged_pennylane import GEDPennylane, ged_active, GEDError
 from mailer import Mailer
@@ -269,6 +270,7 @@ class Worker(threading.Thread):
 
         archived = self._archive(req, files, sent, sent_at)
         ged_ok = self._deposer_ged(req, files)
+        self._suivi_sheet(req, cfe, via, "Envoyé")
 
         lines = [f":white_check_mark: *{req['client_name']}* — {documents.DOCUMENT_TYPES[req['document_type']]['label']} {req['annee']} "
                  f"envoyé à {req['client_email']}" + (f" (redirigé vers {config.TEST_RECIPIENT})" if config.TEST_RECIPIENT else ""),
@@ -307,6 +309,7 @@ class Worker(threading.Thread):
         request_id = req["request_id"]
         db.update_request(request_id, status="DRY_RUN")
         db.add_event(request_id, "DRY_RUN", f"fichiers={len(files)}")
+        self._suivi_sheet(req, analyse, via, "Test")
         if req.get("campaign_id"):   # campagne en mode test : on ne dépose pas des centaines de PDF dans Slack
             return
         preview = self.mailer.preview(req, cabinet, analyse)
@@ -341,6 +344,30 @@ class Worker(threading.Thread):
             log.warning("Archivage Salesforce %s : %s", req["request_id"], e)
             db.add_event(req["request_id"], "ARCHIVE_FAILED", str(e))
             return False
+
+    def _suivi_sheet(self, req: dict, cfe, via: str | None, statut: str) -> None:
+        """Écrit la ligne du client dans le Google Sheet de suivi (au fil de l'eau). Jamais bloquant.
+        cfe : analyse de l'avis (cas, montant, action) ou None. via : compte portail du collaborateur, sinon cabinet."""
+        if not suivi_sheet.suivi_actif() or req["document_type"] != "CFE":
+            return
+        try:
+            s = suivi_sheet.SuiviSheet()
+            montant = getattr(cfe, "montant_a_payer", None)
+            s.enregistrer({
+                "annee": req["annee"],
+                "societe": req.get("client_name") or "",
+                "siren": req.get("siren") or "",
+                "cdm": req.get("cdm_nom") or "",
+                "montant": (f"{montant:,.0f} €".replace(",", " ")) if montant is not None else "",
+                "cas": getattr(cfe, "cas", None),
+                "action_cdm": bool(getattr(cfe, "action_cdm", False)),
+                "compte_portail": via or "cabinet",
+                "statut": statut,
+            })
+            db.add_event(req["request_id"], "SUIVI_SHEET", statut)
+        except Exception as e:   # indisponibilité du Sheet : on journalise, on ne bloque jamais l'envoi
+            log.warning("Suivi Google Sheet %s : %s", req["request_id"], e)
+            db.add_event(req["request_id"], "SUIVI_SHEET_ECHEC", str(e)[:200])
 
     def _deposer_ged(self, req: dict, files: list[Path]) -> bool | None:
         """Dépose les avis CFE dans la GED Pennylane du client. N'échoue jamais la demande :
