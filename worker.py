@@ -18,6 +18,7 @@ import accounts
 import config
 import db
 import documents
+import fenetre_envoi
 from config import Cabinet, PortalAccount
 from ged_pennylane import GEDPennylane, ged_active, GEDError
 from mailer import Mailer
@@ -241,6 +242,16 @@ class Worker(threading.Thread):
             cfe = next((r for r in results if getattr(r, "cas", None)), None)
             return self._deliver_dry_run(req, cabinet, files, skipped, via, analyse=cfe)
 
+        # Campagne : n'envoyer que dans la fenêtre autorisée (lundi-vendredi, hors fériés, 8h30-17h30 Paris).
+        # Une demande manuelle (sans campaign_id) part à toute heure. On attend par pas courts pour rester
+        # réactif à une annulation de campagne ou à un redémarrage du service.
+        if req.get("campaign_id") and not fenetre_envoi.peut_envoyer_maintenant():
+            self._attendre_fenetre(req)
+            c = db.get_campaign(req["campaign_id"])   # campagne annulée pendant l'attente ? on n'envoie pas
+            if c and c["status"] == "CANCELLED":
+                db.update_request(request_id, status="PENDING")   # reprise possible plus tard
+                return
+
         cfe = next((r for r in results if getattr(r, "cas", None)), None)   # analyse de l'avis (gabarit + champs du mail)
         try:
             sent = self.mailer.send(req, cabinet, files, analyse=cfe)
@@ -273,6 +284,23 @@ class Worker(threading.Thread):
             lines.append("• Avis déposé dans la GED Pennylane" if ged_ok
                          else "• :warning: Dépôt GED Pennylane en échec (email et archivage OK)")
         self._notify(req, "\n".join(lines))
+
+    def _attendre_fenetre(self, req: dict) -> None:
+        """Attend la prochaine ouverture de la fenêtre d'envoi (campagnes). Réveil par pas de 60 s pour
+        rester réactif (annulation de campagne, arrêt du service). Journalise l'attente une fois."""
+        import fenetre_envoi
+        attente = fenetre_envoi.secondes_avant_ouverture()
+        if attente <= 0:
+            return
+        ouverture = fenetre_envoi.prochaine_ouverture()
+        log.info("Hors fenêtre d'envoi : demande %s de campagne %s mise en attente jusqu'à %s",
+                 req["request_id"], req.get("campaign_id"), ouverture.strftime("%d/%m %H:%M"))
+        db.add_event(req["request_id"], "ATTENTE_FENETRE", f"jusqu'à {ouverture.strftime('%d/%m %H:%M')}")
+        while not fenetre_envoi.peut_envoyer_maintenant():
+            c = db.get_campaign(req["campaign_id"]) if req.get("campaign_id") else None
+            if c and c["status"] == "CANCELLED":   # campagne annulée : on arrête d'attendre
+                return
+            time.sleep(60)
 
     def _deliver_dry_run(self, req: dict, cabinet: Cabinet, files: list[Path], skipped: list, via: str | None = None, analyse=None) -> None:
         """Mode test : rien ne part chez le client ; PDF + aperçu vont dans DRY_RUN_CHANNEL (sinon en message direct au demandeur)."""
