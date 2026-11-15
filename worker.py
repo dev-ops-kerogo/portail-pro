@@ -1,6 +1,6 @@
 """Worker : traite les demandes une par une, dans un thread dédié (Playwright impose un seul thread).
 
-Pour chaque demande : session portailpro → PDF → email Gmail → archivage Salesforce → notification Slack.
+Pour chaque demande : session portailpro → PDF → email Gmail → archivage Salesforce → dépôt GED Pennylane → notification Slack.
 Comptes portail essayés dans l'ordre : celui du cabinet, puis le compte personnel du chargé de mission du client
 s'il est déclaré (Google Sheet des accès ou .env — voir accounts.py). Un compte « non habilité » pour le client passe la
 main au suivant ; si aucun n'est habilité, la demande passe en NOT_HABILITE (ce n'est pas « aucun document »).
@@ -18,7 +18,10 @@ import accounts
 import config
 import db
 import documents
+import fenetre_envoi
+import suivi_sheet
 from config import Cabinet, PortalAccount
+from ged_pennylane import GEDPennylane, ged_active, GEDError
 from mailer import Mailer
 from portailpro import (NonHabiliteError, PortailLoginAbandoned, PortailLoginRefused, PortailPro, PortailProError,
                         _credentials_key)
@@ -237,10 +240,22 @@ class Worker(threading.Thread):
                                      f"{req['annee']} : aucun document trouvé sur le portail{where}. *Aucun email envoyé.*")
 
         if config.DRY_RUN or req.get("dry_run"):
-            return self._deliver_dry_run(req, cabinet, files, skipped, via)
+            cfe = next((r for r in results if getattr(r, "cas", None)), None)
+            return self._deliver_dry_run(req, cabinet, files, skipped, via, analyse=cfe)
 
+        # Campagne : n'envoyer que dans la fenêtre autorisée (lundi-vendredi, hors fériés, 8h30-17h30 Paris).
+        # Une demande manuelle (sans campaign_id) part à toute heure. On attend par pas courts pour rester
+        # réactif à une annulation de campagne ou à un redémarrage du service.
+        if req.get("campaign_id") and not fenetre_envoi.peut_envoyer_maintenant():
+            self._attendre_fenetre(req)
+            c = db.get_campaign(req["campaign_id"])   # campagne annulée pendant l'attente ? on n'envoie pas
+            if c and c["status"] == "CANCELLED":
+                db.update_request(request_id, status="PENDING")   # reprise possible plus tard
+                return
+
+        cfe = next((r for r in results if getattr(r, "cas", None)), None)   # analyse de l'avis (gabarit + champs du mail)
         try:
-            sent = self.mailer.send(req, cabinet, files)
+            sent = self.mailer.send(req, cabinet, files, analyse=cfe)
         except Exception as e:
             log.exception("Envoi email %s", request_id)
             self._alert(f":rotating_light: Échec envoi Gmail sur `{request_id}` ({req['client_name']}) : `{e}`")
@@ -249,7 +264,13 @@ class Worker(threading.Thread):
         db.update_request(request_id, status="SENT", gmail_message_id=sent.gmail_id, sent_at=sent_at)
         db.add_event(request_id, "SENT", f"gmail={sent.gmail_id} fichiers={len(files)}")
 
+        # données lues dans l'avis : tableau récap (cfe déjà calculé avant l'envoi)
+        if cfe:
+            db.update_request(request_id, cas_paiement=cfe.cas, action_cdm=1 if cfe.action_cdm else 0)
+
         archived = self._archive(req, files, sent, sent_at)
+        ged_ok = self._deposer_ged(req, files)
+        self._suivi_sheet(req, cfe, via, "Envoyé")
 
         lines = [f":white_check_mark: *{req['client_name']}* — {documents.DOCUMENT_TYPES[req['document_type']]['label']} {req['annee']} "
                  f"envoyé à {req['client_email']}" + (f" (redirigé vers {config.TEST_RECIPIENT})" if config.TEST_RECIPIENT else ""),
@@ -261,16 +282,37 @@ class Worker(threading.Thread):
         if archived is not None:
             lines.append("• PDF et email enregistrés sur la fiche Salesforce" + (" (compte de test)" if config.ARCHIVE_TEST_ACCOUNT_ID else "")
                          if archived else "• :warning: Archivage Salesforce en échec (email bien envoyé)")
+        if ged_ok is not None:
+            lines.append("• Avis déposé dans la GED Pennylane" if ged_ok
+                         else "• :warning: Dépôt GED Pennylane en échec (email et archivage OK)")
         self._notify(req, "\n".join(lines))
 
-    def _deliver_dry_run(self, req: dict, cabinet: Cabinet, files: list[Path], skipped: list, via: str | None = None) -> None:
+    def _attendre_fenetre(self, req: dict) -> None:
+        """Attend la prochaine ouverture de la fenêtre d'envoi (campagnes). Réveil par pas de 60 s pour
+        rester réactif (annulation de campagne, arrêt du service). Journalise l'attente une fois."""
+        import fenetre_envoi
+        attente = fenetre_envoi.secondes_avant_ouverture()
+        if attente <= 0:
+            return
+        ouverture = fenetre_envoi.prochaine_ouverture()
+        log.info("Hors fenêtre d'envoi : demande %s de campagne %s mise en attente jusqu'à %s",
+                 req["request_id"], req.get("campaign_id"), ouverture.strftime("%d/%m %H:%M"))
+        db.add_event(req["request_id"], "ATTENTE_FENETRE", f"jusqu'à {ouverture.strftime('%d/%m %H:%M')}")
+        while not fenetre_envoi.peut_envoyer_maintenant():
+            c = db.get_campaign(req["campaign_id"]) if req.get("campaign_id") else None
+            if c and c["status"] == "CANCELLED":   # campagne annulée : on arrête d'attendre
+                return
+            time.sleep(60)
+
+    def _deliver_dry_run(self, req: dict, cabinet: Cabinet, files: list[Path], skipped: list, via: str | None = None, analyse=None) -> None:
         """Mode test : rien ne part chez le client ; PDF + aperçu vont dans DRY_RUN_CHANNEL (sinon en message direct au demandeur)."""
         request_id = req["request_id"]
         db.update_request(request_id, status="DRY_RUN")
         db.add_event(request_id, "DRY_RUN", f"fichiers={len(files)}")
+        self._suivi_sheet(req, analyse, via, "Test")
         if req.get("campaign_id"):   # campagne en mode test : on ne dépose pas des centaines de PDF dans Slack
             return
-        preview = self.mailer.preview(req, cabinet)
+        preview = self.mailer.preview(req, cabinet, analyse)
         text = (f":test_tube: *Mode test* — demande de <@{req['slack_user_id']}> — *{req['client_name']}* (SIREN {req['siren']}) : "
                 f"{len(files)} PDF récupéré(s), *aucun email envoyé, aucun archivage*.\n"
                 + (f"• Récupéré via le compte portail de {via}\n" if via else "")
@@ -302,6 +344,60 @@ class Worker(threading.Thread):
             log.warning("Archivage Salesforce %s : %s", req["request_id"], e)
             db.add_event(req["request_id"], "ARCHIVE_FAILED", str(e))
             return False
+
+    def _suivi_sheet(self, req: dict, cfe, via: str | None, statut: str) -> None:
+        """Écrit la ligne du client dans le Google Sheet de suivi (au fil de l'eau). Jamais bloquant.
+        cfe : analyse de l'avis (cas, montant, action) ou None. via : compte portail du collaborateur, sinon cabinet."""
+        if not suivi_sheet.suivi_actif() or req["document_type"] != "CFE":
+            return
+        try:
+            s = suivi_sheet.SuiviSheet()
+            montant = getattr(cfe, "montant_a_payer", None)
+            s.enregistrer({
+                "annee": req["annee"],
+                "societe": req.get("client_name") or "",
+                "siren": req.get("siren") or "",
+                "cdm": req.get("cdm_nom") or "",
+                "montant": (f"{montant:,.0f} €".replace(",", " ")) if montant is not None else "",
+                "cas": getattr(cfe, "cas", None),
+                "action_cdm": bool(getattr(cfe, "action_cdm", False)),
+                "compte_portail": via or "cabinet",
+                "statut": statut,
+            })
+            db.add_event(req["request_id"], "SUIVI_SHEET", statut)
+        except Exception as e:   # indisponibilité du Sheet : on journalise, on ne bloque jamais l'envoi
+            log.warning("Suivi Google Sheet %s : %s", req["request_id"], e)
+            db.add_event(req["request_id"], "SUIVI_SHEET_ECHEC", str(e)[:200])
+
+    def _deposer_ged(self, req: dict, files: list[Path]) -> bool | None:
+        """Dépose les avis CFE dans la GED Pennylane du client. N'échoue jamais la demande :
+        une erreur est journalisée et alertée, mais l'email au client est déjà parti.
+        None = dépôt GED désactivé ou type de document non concerné."""
+        if not ged_active() or req["document_type"] != "CFE":
+            return None
+        try:
+            ged = GEDPennylane()
+        except GEDError as e:
+            log.warning("GED Pennylane indisponible : %s", e)
+            return None
+        ok = True
+        try:
+            for p in files:
+                try:
+                    ged.deposer(req["siren"], req["annee"], p.name, p.read_bytes())
+                    db.add_event(req["request_id"], "GED_DEPOSEE", p.name)
+                except GEDError as e:
+                    ok = False
+                    db.add_event(req["request_id"], "GED_ECHEC", f"{p.name} : {e}")
+                    self._alert(f":open_file_folder: Dépôt GED Pennylane en échec pour *{req['client_name']}* "
+                                f"(SIREN {req['siren']}) : {e}. L'avis a bien été envoyé au client et archivé Salesforce.")
+        except Exception as e:   # erreur inattendue : on ne fait jamais échouer la demande pour ça
+            ok = False
+            log.warning("Dépôt GED %s : %s", req["request_id"], e)
+            db.add_event(req["request_id"], "GED_ECHEC", str(e))
+        finally:
+            ged.close()
+        return ok
 
     # ------------------------------------------------------------ issues
     def _not_habilite(self, req: dict, labels: list[str], collabs: dict[str, PortalAccount] | None = None) -> None:

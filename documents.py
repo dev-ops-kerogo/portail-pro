@@ -7,20 +7,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from portailpro import PortailPro
+from lecture_cfe import lire_avis_cfe
 
 DOCUMENT_TYPES = {
     "CFE": {"label": "Avis d'imposition CFE", "unit": "ETABLISSEMENT", "needs_periode": False},
-    # "TVA": {"label": "Déclaration TVA", "unit": "ENTREPRISE", "needs_periode": True},   # parcours à cartographier
+    # "TVA": {"label": "Déclaration TVA", "unit": "ENTREPRISE", "needs_periode": True},  # parcours à cartographier
 }
 
 
 @dataclass
 class DocResult:
-    label: str            # ex. "SIRET 12345678900011 – SOCIETE EXEMPLE"
-    filename: str         # nom de la pièce jointe
+    label: str          # ex. "SIRET 12345678900011 – SOCIETE EXEMPLE"
+    filename: str       # nom de la pièce jointe
     content: bytes | None
-    status: str           # DOWNLOADED | SKIPPED
+    status: str         # DOWNLOADED | SKIPPED
     message: str = ""
+    # --- analyse de l'avis CFE (None pour les pièces non analysées : avis de suite, autres types) ---
+    cas: str | None = None                 # RIEN_A_PAYER | A_PAYER | PRELEVEMENT_ECHEANCE | MENSUALISE | INDETERMINE
+    montant_a_payer: float | None = None
+    action_cdm: bool | None = None
+    date_limite: str | None = None         # cas A_PAYER : date limite de paiement
+    date_prelevement: str | None = None    # cas PRELEVEMENT_ECHEANCE : date du prélèvement
+    solde_restant: float | None = None     # cas MENSUALISE : somme restant à prélever
 
 
 def fetch(portail: PortailPro, document_type: str, siren: str, annee: str, periode: str | None = None) -> list[DocResult]:
@@ -38,8 +46,16 @@ def fetch_cfe(portail: PortailPro, siren: str, annee: str) -> list[DocResult]:
     results = []
     for a in sorted(avis, key=lambda a: (a.siret, a.reference)):
         label = f"SIRET {a.siret} – {a.commune}".strip(" –")
+        contenu = portail.download_document(siren, a.id_principal)
+        analyse = lire_avis_cfe(contenu) if contenu else None
         results.append(DocResult(label=label, filename=f"CFE_{annee}_{a.siret}.pdf",
-                                 content=portail.download_document(siren, a.id_principal), status="DOWNLOADED"))
+                                 content=contenu, status="DOWNLOADED",
+                                 cas=analyse.cas if analyse else None,
+                                 montant_a_payer=analyse.montant_a_payer if analyse else None,
+                                 action_cdm=analyse.action_cdm if analyse else None,
+                                 date_limite=analyse.date_limite if analyse else None,
+                                 date_prelevement=analyse.date_prelevement if analyse else None,
+                                 solde_restant=analyse.solde_restant if analyse else None))
         if a.id_suite:
             results.append(DocResult(label=label + " (suite)", filename=f"CFE_{annee}_{a.siret}_suite.pdf",
                                      content=portail.download_document(siren, a.id_suite), status="DOWNLOADED"))

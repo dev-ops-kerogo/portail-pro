@@ -14,94 +14,93 @@ from config import DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS document_requests (
-  request_id      TEXT PRIMARY KEY,
-  slack_user_id   TEXT NOT NULL,
+  request_id TEXT PRIMARY KEY,
+  slack_user_id TEXT NOT NULL,
   slack_user_name TEXT,
-  sf_account_id   TEXT,
-  client_name     TEXT,
-  siren           TEXT,
-  entite          TEXT,
-  client_email    TEXT,
+  sf_account_id TEXT,
+  client_name TEXT,
+  siren TEXT,
+  entite TEXT,
+  client_email TEXT,
   client_civilite TEXT,
-  client_nom      TEXT,
-  client_prenom   TEXT,
-  cdm_nom         TEXT,
-  cdm_email       TEXT,
-  cdm_telephone   TEXT,
-  agence          TEXT,
-  campaign_id     TEXT,
-  document_type   TEXT NOT NULL,
-  annee           TEXT NOT NULL,
-  periode         TEXT,
-  dry_run         INTEGER NOT NULL DEFAULT 0,
-  status          TEXT NOT NULL DEFAULT 'PENDING',
-  error_message   TEXT,
+  client_nom TEXT,
+  client_prenom TEXT,
+  cdm_nom TEXT,
+  cdm_email TEXT,
+  cdm_telephone TEXT,
+  agence TEXT,
+  campaign_id TEXT,
+  document_type TEXT NOT NULL,
+  annee TEXT NOT NULL,
+  periode TEXT,
+  dry_run INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'PENDING',
+  error_message TEXT,
   gmail_message_id TEXT,
-  created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL,
-  sent_at         TEXT
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  sent_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_req_status ON document_requests(status);
 CREATE INDEX IF NOT EXISTS idx_req_dedup ON document_requests(sf_account_id, document_type, annee, periode, created_at);
 
 CREATE TABLE IF NOT EXISTS request_documents (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  request_id    TEXT NOT NULL REFERENCES document_requests(request_id),
-  label         TEXT,
-  status        TEXT NOT NULL,
-  file_path     TEXT,
-  message       TEXT,
-  created_at    TEXT NOT NULL
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL REFERENCES document_requests(request_id),
+  label TEXT,
+  status TEXT NOT NULL,
+  file_path TEXT,
+  message TEXT,
+  created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_doc_request ON request_documents(request_id);
 
 CREATE TABLE IF NOT EXISTS campaigns (
-  campaign_id     TEXT PRIMARY KEY,
-  created_at      TEXT NOT NULL,
-  updated_at      TEXT NOT NULL,
-  created_by      TEXT NOT NULL,
+  campaign_id TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  created_by TEXT NOT NULL,
   created_by_name TEXT,
-  entite          TEXT NOT NULL,
-  document_type   TEXT NOT NULL,
-  annee           TEXT NOT NULL,
-  source          TEXT NOT NULL,          -- salesforce | sirens
-  sirens          TEXT,                   -- liste saisie (source = sirens)
-  send_limit      INTEGER,                -- nombre max d'envois (tests)
-  status          TEXT NOT NULL,          -- INVENTORY | INVENTORY_DONE | SENDING | DONE | CANCELLED | FAILED
-  message         TEXT,
-  slack_channel   TEXT,
-  slack_ts        TEXT,
+  entite TEXT NOT NULL,
+  document_type TEXT NOT NULL,
+  annee TEXT NOT NULL,
+  source TEXT NOT NULL,       -- salesforce | sirens
+  sirens TEXT,                -- liste saisie (source = sirens)
+  send_limit INTEGER,         -- nombre max d'envois (tests)
+  status TEXT NOT NULL,       -- INVENTORY | INVENTORY_DONE | SENDING | DONE | CANCELLED | FAILED
+  message TEXT,
+  slack_channel TEXT,
+  slack_ts TEXT,
   inventory_started_at TEXT, inventory_finished_at TEXT,
   send_started_at TEXT, send_finished_at TEXT,
-  send_by         TEXT
+  send_by TEXT
 );
 CREATE TABLE IF NOT EXISTS campaign_items (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  campaign_id     TEXT NOT NULL REFERENCES campaigns(campaign_id),
-  sf_account_id   TEXT,
-  client_name     TEXT,
-  siren           TEXT,
-  entite          TEXT,
-  client_email    TEXT,
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  campaign_id TEXT NOT NULL REFERENCES campaigns(campaign_id),
+  sf_account_id TEXT,
+  client_name TEXT,
+  siren TEXT,
+  entite TEXT,
+  client_email TEXT,
   client_civilite TEXT, client_nom TEXT, client_prenom TEXT,
-  cdm_nom         TEXT, cdm_email TEXT, cdm_telephone TEXT,
-  status          TEXT NOT NULL DEFAULT 'PENDING',   -- PENDING | FOUND | NO_DOCUMENT | NO_EMAIL | ALREADY_SENT | NOT_HABILITE | COMPTE_INDISPONIBLE | ERROR
-  avis_count      INTEGER,
-  montant_total   REAL,
-  detail          TEXT,
-  request_id      TEXT,
-  updated_at      TEXT
+  cdm_nom TEXT, cdm_email TEXT, cdm_telephone TEXT,
+  status TEXT NOT NULL DEFAULT 'PENDING',   -- PENDING | FOUND | NO_DOCUMENT | NO_EMAIL | ALREADY_SENT | NOT_HABILITE | COMPTE_INDISPONIBLE | ERROR
+  avis_count INTEGER,
+  montant_total REAL,
+  detail TEXT,
+  request_id TEXT,
+  updated_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_citem_campaign ON campaign_items(campaign_id, status);
 CREATE TABLE IF NOT EXISTS request_events (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  request_id  TEXT NOT NULL,
-  event       TEXT NOT NULL,
-  details     TEXT,
-  created_at  TEXT NOT NULL
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id TEXT NOT NULL,
+  event TEXT NOT NULL,
+  details TEXT,
+  created_at TEXT NOT NULL
 );
 """
-
 
 # Appelé après chaque écriture avec l'identifiant de la demande (branché par mysql_journal.install()).
 on_change = None
@@ -134,7 +133,7 @@ def init_db() -> None:
     with connect() as con:
         con.executescript(SCHEMA)
         cols = {r["name"] for r in con.execute("PRAGMA table_info(document_requests)")}
-        if "dry_run" not in cols:  # base créée avant l'ajout du mode test
+        if "dry_run" not in cols:   # base créée avant l'ajout du mode test
             con.execute("ALTER TABLE document_requests ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0")
         if "agence" not in cols:
             con.execute("ALTER TABLE document_requests ADD COLUMN agence TEXT")
@@ -143,6 +142,10 @@ def init_db() -> None:
             con.execute("CREATE INDEX IF NOT EXISTS idx_req_campaign ON document_requests(campaign_id, status)")
         if "portail_compte" not in cols:   # compte portail sur lequel l'inventaire de campagne a trouvé le document
             con.execute("ALTER TABLE document_requests ADD COLUMN portail_compte TEXT")
+        if "cas_paiement" not in cols:     # cas de paiement lu dans l'avis CFE (RIEN_A_PAYER / A_PAYER / PRELEVEMENT_ECHEANCE / MENSUALISE / INDETERMINE)
+            con.execute("ALTER TABLE document_requests ADD COLUMN cas_paiement TEXT")
+        if "action_cdm" not in cols:       # 1 si le chargé de mission doit aller payer (cas A_PAYER)
+            con.execute("ALTER TABLE document_requests ADD COLUMN action_cdm INTEGER")
         item_cols = {r["name"] for r in con.execute("PRAGMA table_info(campaign_items)")}
         if "portail_compte" not in item_cols:
             con.execute("ALTER TABLE campaign_items ADD COLUMN portail_compte TEXT")
